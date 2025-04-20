@@ -10,7 +10,11 @@
 #include <map>
 #include <set>
 #include <list>
+#include <unordered_map>
 #include <optional>
+
+#include "WaylandServer/WaylandDecls.h"
+#include "WaylandServer/WaylandServerLegacy.h"
 
 #include <pixman-1/pixman.h>
 
@@ -27,27 +31,6 @@
 struct _XDisplay;
 struct xwayland_ctx_t;
 
-struct wlserver_vk_swapchain_feedback
-{
-	uint32_t image_count;
-	VkFormat vk_format;
-	VkColorSpaceKHR vk_colorspace;
-	VkCompositeAlphaFlagBitsKHR vk_composite_alpha;
-	VkSurfaceTransformFlagBitsKHR vk_pre_transform;
-	VkBool32 vk_clipped;
-
-	std::shared_ptr<gamescope::BackendBlob> hdr_metadata_blob;
-};
-
-
-struct GamescopeTimelinePoint
-{
-	struct wlr_render_timeline *pTimeline = nullptr;
-	uint64_t ulPoint = 0;
-
-	void Release();
-};
-
 struct GamescopeAcquireTimelineState
 {
 	int32_t nEventFd = -1;
@@ -63,11 +46,13 @@ struct ResListEntry_t {
 	std::vector<struct wl_resource*> presentation_feedbacks;
 	std::optional<uint32_t> present_id;
 	uint64_t desired_present_time;
-	std::optional<GamescopeAcquireTimelineState> oAcquireState;
-	std::optional<GamescopeTimelinePoint> oReleasePoint;
+	std::shared_ptr<gamescope::CAcquireTimelinePoint> pAcquirePoint;
+	std::shared_ptr<gamescope::CReleaseTimelinePoint> pReleasePoint;
 };
 
 struct wlserver_content_override;
+
+bool wlserver_is_lock_held(void);
 
 class gamescope_xwayland_server_t
 {
@@ -91,7 +76,7 @@ public:
 
 	std::vector<ResListEntry_t>& retrieve_commits();
 
-	void handle_override_window_content( struct wl_client *client, struct wl_resource *resource, struct wlr_surface *surface, uint32_t x11_window );
+	void handle_override_window_content( struct wl_client *client, struct wl_resource *gamescope_swapchain_resource, struct wlr_surface *surface, uint32_t x11_window );
 	void destroy_content_override( struct wlserver_x11_surface_info *x11_surface, struct wlr_surface *surf);
 	void destroy_content_override(struct wlserver_content_override *co);
 
@@ -131,7 +116,6 @@ struct wlserver_t {
 		struct wlr_compositor *compositor;
 		struct wlr_session *session;
 		struct wlr_seat *seat;
-		struct wlr_linux_drm_syncobj_manager_v1 *drm_syncobj_manager_v1;
 
 		// Used to simulate key events and set the keymap
 		struct wlr_keyboard *virtual_keyboard_device;
@@ -143,11 +127,34 @@ struct wlserver_t {
 	
 	struct wlr_surface *mouse_focus_surface;
 	struct wlr_surface *kb_focus_surface;
+	std::unordered_map<struct wlr_surface *, std::pair<int, int>> current_dropdown_surfaces;
 	double mouse_surface_cursorx = 0.0f;
 	double mouse_surface_cursory = 0.0f;
 	bool mouse_constraint_requires_warp = false;
 	pixman_region32_t confine;
-	struct wlr_pointer_constraint_v1 *mouse_constraint = nullptr;
+	std::atomic<struct wlr_pointer_constraint_v1 *> mouse_constraint = { nullptr };
+
+	void SetMouseConstraint( struct wlr_pointer_constraint_v1 *pConstraint )
+	{
+		assert( wlserver_is_lock_held() );
+		// Set by wlserver only. Read by both wlserver + steamcompmgr with no
+		// need to actually be sequentially consistent.
+		mouse_constraint.store( pConstraint, std::memory_order_relaxed );
+	}
+
+	struct wlr_pointer_constraint_v1 *GetCursorConstraint() const
+	{
+		assert( wlserver_is_lock_held() );
+		return mouse_constraint.load( std::memory_order_relaxed );
+	}
+
+	bool HasMouseConstraint() const
+	{
+		// Does not need to be sequentially consistent.
+		// Used by the steamcompmgr thread to check if there is currently a mouse constraint.
+		return mouse_constraint.load( std::memory_order_relaxed ) != nullptr;
+	}
+
 	uint64_t ulLastMovedCursorTime = 0;
 	bool bCursorHidden = true;
 	bool bCursorHasImage = true;
@@ -165,10 +172,12 @@ struct wlserver_t {
 	struct wl_listener new_input_method;
 
 	struct wlr_xdg_shell *xdg_shell;
+	struct wlr_layer_shell_v1 *layer_shell_v1;
 	struct wlr_relative_pointer_manager_v1 *relative_pointer_manager;
 	struct wlr_pointer_constraints_v1 *constraints;
 	struct wl_listener new_xdg_surface;
 	struct wl_listener new_xdg_toplevel;
+	struct wl_listener new_layer_shell_surface;
 	struct wl_listener new_pointer_constraint;
 	std::vector<std::shared_ptr<steamcompmgr_win_t>> xdg_wins;
 	std::atomic<bool> xdg_dirty;
@@ -176,6 +185,8 @@ struct wlserver_t {
 	std::vector<ResListEntry_t> xdg_commit_queue;
 
 	std::vector<wl_resource*> gamescope_controls;
+
+	std::atomic<bool> bWaylandServerRunning = { false };
 };
 
 extern struct wlserver_t wlserver;
@@ -224,6 +235,8 @@ void wlserver_keyboardfocus( struct wlr_surface *surface, bool bConstrain = true
 void wlserver_key( uint32_t key, bool press, uint32_t time );
 
 void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x = 0, int y = 0 );
+void wlserver_clear_dropdowns();
+void wlserver_notify_dropdown( struct wlr_surface *wlrsurface, int nX, int nY );
 void wlserver_mousemotion( double x, double y, uint32_t time );
 void wlserver_mousehide();
 void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic );
@@ -252,30 +265,6 @@ void wlserver_set_output_info( const wlserver_output_info *info );
 
 gamescope_xwayland_server_t *wlserver_get_xwayland_server( size_t index );
 const char *wlserver_get_wl_display_name( void );
-
-struct wlserver_wl_surface_info
-{
-	wlserver_x11_surface_info *x11_surface = nullptr;
-	wlserver_xdg_surface_info *xdg_surface = nullptr;
-
-
-	struct wlr_surface *wlr = nullptr;
-	struct wl_listener commit;
-	struct wl_listener destroy;
-
-	std::shared_ptr<wlserver_vk_swapchain_feedback> swapchain_feedback = {};
-	std::optional<VkPresentModeKHR> oCurrentPresentMode;
-
-	uint64_t sequence = 0;
-	std::vector<struct wl_resource*> pending_presentation_feedbacks;
-
-	std::vector<struct wl_resource *> gamescope_swapchains;
-	std::optional<uint32_t> present_id = std::nullopt;
-	uint64_t desired_present_time = 0;
-
-	uint64_t last_refresh_cycle = 0;
-};
-wlserver_wl_surface_info *get_wl_surface_info(struct wlr_surface *wlr_surf);
 
 void wlserver_x11_surface_info_init( struct wlserver_x11_surface_info *surf, gamescope_xwayland_server_t *server, uint32_t x11_id );
 void wlserver_x11_surface_info_finish( struct wlserver_x11_surface_info *surf );

@@ -95,6 +95,8 @@ public:
 	void GetDesiredSize( int& nWidth, int &nHeight );
 
 	void checkSuspension();
+
+	bool IsConstrained() const { return m_bConstrained; }
 private:
 
 	bool getTexture();
@@ -102,10 +104,12 @@ private:
 	void updateCursorFeedback( bool bForce = false );
 
 	int m_x = 0, m_y = 0;
+	bool m_bConstrained = false;
 	int m_hotspotX = 0, m_hotspotY = 0;
 
 	gamescope::OwningRc<CVulkanTexture> m_texture;
 	bool m_dirty;
+	uint64_t m_ulLastConnectorId = 0;
 	bool m_imageEmpty;
 
 	xwayland_ctx_t *m_ctx;
@@ -133,7 +137,6 @@ void nudge_steamcompmgr( void );
 void force_repaint( void );
 
 extern void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns );
-gamescope_xwayland_server_t *steamcompmgr_get_focused_server();
 struct wlr_surface *steamcompmgr_get_server_input_surface( size_t idx );
 wlserver_vk_swapchain_feedback* steamcompmgr_get_base_layer_swapchain_feedback();
 
@@ -141,13 +144,16 @@ struct wlserver_x11_surface_info *lookup_x11_surface_info_from_xid( gamescope_xw
 
 extern gamescope::VBlankTime g_SteamCompMgrVBlankTime;
 extern pid_t focusWindow_pid;
+extern std::shared_ptr<std::string> focusWindow_engine;
 
 void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_server);
 void gamescope_set_selection(std::string contents, GamescopeSelection eSelection);
+void gamescope_set_reshade_effect(std::string effect_path);
+void gamescope_clear_reshade_effect();
 
 MouseCursor *steamcompmgr_get_current_cursor();
 MouseCursor *steamcompmgr_get_server_cursor(uint32_t serverId);
 
-extern int g_nAsyncFlipsEnabled;
+extern gamescope::ConVar<bool> cv_tearing_enabled;
 
 extern void steamcompmgr_set_app_refresh_cycle_override( gamescope::GamescopeScreenType type, int override_fps, bool change_refresh, bool change_fps_cap );

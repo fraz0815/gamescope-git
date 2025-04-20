@@ -1,5 +1,7 @@
 // DRM output stuff
 
+#include "Script/Script.h"
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -27,7 +29,7 @@
 
 #include "backend.h"
 #include "color_helpers.h"
-#include "defer.hpp"
+#include "Utils/Defer.h"
 #include "drm_include.h"
 #include "edid.h"
 #include "gamescope_shared.h"
@@ -58,16 +60,111 @@ extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
 
 gamescope::ConVar<bool> cv_drm_single_plane_optimizations( "drm_single_plane_optimizations", true, "Whether or not to enable optimizations for single plane usage." );
+
 gamescope::ConVar<bool> cv_drm_debug_disable_shaper_and_3dlut( "drm_debug_disable_shaper_and_3dlut", false, "Shaper + 3DLUT chicken bit. (Force disable/DEFAULT, no logic change)" );
 gamescope::ConVar<bool> cv_drm_debug_disable_degamma_tf( "drm_debug_disable_degamma_tf", false, "Degamma chicken bit. (Forces DEGAMMA_TF to DEFAULT, does not affect other logic)" );
 gamescope::ConVar<bool> cv_drm_debug_disable_regamma_tf( "drm_debug_disable_regamma_tf", false, "Regamma chicken bit. (Forces REGAMMA_TF to DEFAULT, does not affect other logic)" );
 gamescope::ConVar<bool> cv_drm_debug_disable_output_tf( "drm_debug_disable_output_tf", false, "Force default (identity) output TF, affects other logic. Not a property directly." );
 gamescope::ConVar<bool> cv_drm_debug_disable_blend_tf( "drm_debug_disable_blend_tf", false, "Blending chicken bit. (Forces BLEND_TF to DEFAULT, does not affect other logic)" );
+gamescope::ConVar<bool> cv_drm_debug_disable_ctm( "drm_debug_disable_ctm", false, "CTM chicken bit. (Forces CTM off, does not affect other logic)" );
+gamescope::ConVar<bool> cv_drm_debug_disable_color_encoding( "drm_debug_disable_color_encoding", false, "YUV Color Encoding chicken bit. (Forces COLOR_ENCODING to DEFAULT, does not affect other logic)" );
+gamescope::ConVar<bool> cv_drm_debug_disable_color_range( "drm_debug_disable_color_range", false, "YUV Color Range chicken bit. (Forces COLOR_RANGE to DEFAULT, does not affect other logic)" );
 gamescope::ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_explicit_sync", false, "Force disable explicit sync on the DRM backend." );
 gamescope::ConVar<bool> cv_drm_debug_disable_in_fence_fd( "drm_debug_disable_in_fence_fd", false, "Force disable IN_FENCE_FD being set to avoid over-synchronization on the DRM backend." );
 
+gamescope::ConVar<bool> cv_drm_allow_dynamic_modes_for_external_display( "drm_allow_dynamic_modes_for_external_display", false, "Allow dynamic mode/refresh rate switching for external displays." );
+
+int HackyDRMPresent( const FrameInfo_t *pFrameInfo, bool bAsync );
+
+struct saved_mode {
+	int width;
+	int height;
+	int refresh;
+};
+
+gamescope::ConVar<bool> cv_drm_ignore_internal_connectors( "drm_ignore_internal_connectors", false, "Disable internal displays for good, for debugging." );
+
 namespace gamescope
 {
+	class CDRMPlane;
+	class CDRMCRTC;
+	class CDRMConnector;
+}
+
+struct drm_t {
+	bool bUseLiftoff;
+
+	int fd = -1;
+
+	int preferred_width, preferred_height, preferred_refresh;
+
+	uint64_t cursor_width, cursor_height;
+	bool allow_modifiers;
+	struct wlr_drm_format_set formats;
+
+	std::vector< std::unique_ptr< gamescope::CDRMPlane > > planes;
+	std::vector< std::unique_ptr< gamescope::CDRMCRTC > > crtcs;
+	std::unordered_map< uint32_t, gamescope::CDRMConnector > connectors;
+
+	gamescope::CDRMPlane *pPrimaryPlane;
+	gamescope::CDRMCRTC *pCRTC;
+	gamescope::CDRMConnector *pConnector;
+
+	struct wlr_drm_format_set primary_formats;
+
+	drmModeAtomicReq *req;
+	uint32_t flags;
+
+	struct liftoff_device *lo_device;
+	struct liftoff_output *lo_output;
+	struct liftoff_layer *lo_layers[ k_nMaxLayers ];
+
+	std::shared_ptr<gamescope::BackendBlob> sdr_static_metadata;
+
+	struct drm_state_t {
+		std::shared_ptr<gamescope::BackendBlob> mode_id;
+		uint32_t color_mgmt_serial;
+		std::shared_ptr<gamescope::BackendBlob> lut3d_id[ EOTF_Count ];
+		std::shared_ptr<gamescope::BackendBlob> shaperlut_id[ EOTF_Count ];
+		amdgpu_transfer_function output_tf = AMDGPU_TRANSFER_FUNCTION_DEFAULT;
+	} current, pending;
+
+	// FBs in the atomic request, but not yet submitted to KMS
+	// Accessed only on req thread
+	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_FbIdsInRequest;
+
+	// FBs currently queued to go on screen.
+	// May be accessed by page flip handler thread and req thread, thus mutex.
+	std::mutex m_QueuedFbIdsMutex;
+	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_QueuedFbIds;
+	// FBs currently on screen.
+	// Accessed only on page flip handler thread.
+	std::mutex m_mutVisibleFbIds;
+	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_VisibleFbIds;
+
+	std::atomic < uint32_t > uPendingFlipCount = { 0 };
+
+	std::atomic < bool > paused = { false };
+	std::atomic < int > out_of_date = { false };
+	std::atomic < bool > needs_modeset = { false };
+
+	std::unordered_map< std::string, int > connector_priorities;
+
+	char *device_name = nullptr;
+};
+
+void drm_drop_fbid( struct drm_t *drm, uint32_t fbid );
+bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode );
+
+
+using namespace std::literals;
+
+struct drm_t g_DRM = {};
+
+namespace gamescope
+{
+	class CDRMBackend;
+
 	std::tuple<int32_t, int32_t, int32_t> GetKernelVersion()
 	{
 		utsname name;
@@ -253,10 +350,10 @@ namespace gamescope
 		CRTCProperties m_Props;
 	};
 
-	class CDRMConnector final : public IBackendConnector, public CDRMAtomicTypedObject<DRM_MODE_OBJECT_CONNECTOR>
+	class CDRMConnector final : public CBaseBackendConnector, public CDRMAtomicTypedObject<DRM_MODE_OBJECT_CONNECTOR>
 	{
 	public:
-		CDRMConnector( drmModeConnector *pConnector );
+		CDRMConnector( CDRMBackend *pBackend, drmModeConnector *pConnector );
 
 		void RefreshState();
 
@@ -281,9 +378,9 @@ namespace gamescope
 		const char *GetName() const override { return m_Mutable.szName; }
 		const char *GetMake() const override { return m_Mutable.pszMake; }
 		const char *GetModel() const override { return m_Mutable.szModel; }
+		const char *GetDataString() const { return m_Mutable.szDataString; }
 		uint32_t GetPossibleCRTCMask() const { return m_Mutable.uPossibleCRTCMask; }
 		std::span<const uint32_t> GetValidDynamicRefreshRates() const override { return m_Mutable.ValidDynamicRefreshRates; }
-		GamescopeKnownDisplays GetKnownDisplayType() const { return m_Mutable.eKnownDisplay; }
 		const displaycolorimetry_t& GetDisplayColorimetry() const { return m_Mutable.DisplayColorimetry; }
 
 		std::span<const uint8_t> GetRawEDID() const override { return std::span<const uint8_t>{ m_Mutable.EdidData.begin(), m_Mutable.EdidData.end() }; }
@@ -338,6 +435,14 @@ namespace gamescope
 
 		const BackendConnectorHDRInfo &GetHDRInfo() const override { return m_Mutable.HDR; }
 
+		virtual bool IsVRRActive() const override
+		{
+			if ( !g_DRM.pCRTC || !g_DRM.pCRTC->GetProperties().VRR_ENABLED )
+				return false;
+
+			return !!g_DRM.pCRTC->GetProperties().VRR_ENABLED->GetCurrentValue();
+		}
+
 		virtual std::span<const BackendMode> GetModes() const override { return m_Mutable.BackendModes; }
 
 		bool SupportsVRR() const override
@@ -366,13 +471,20 @@ namespace gamescope
 			}
 		}
 
+		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override;
+
+		using DRMModeGenerator = std::function<drmModeModeInfo(const drmModeModeInfo *, int)>;
+		const DRMModeGenerator &GetModeGenerator() const
+		{
+			return m_Mutable.fnDynamicModeGenerator;
+		}
 		void UpdateEffectiveOrientation( const drmModeModeInfo *pMode );
 
 	private:
 		void ParseEDID();
 
-		static std::optional<BackendConnectorHDRInfo> GetKnownDisplayHDRInfo( GamescopeKnownDisplays eKnownDisplay );
 
+		CDRMBackend *m_pBackend = nullptr;
 		CAutoDeletePtr<drmModeConnector> m_pConnector;
 
 		struct MutableConnectorState
@@ -383,9 +495,10 @@ namespace gamescope
 			char szName[32]{};
 			char szMakePNP[4]{};
 			char szModel[16]{};
+			char szDataString[16]{};
 			const char *pszMake = ""; // Not owned, no free. This is a pointer to pnp db or szMakePNP.
-			GamescopeKnownDisplays eKnownDisplay = GAMESCOPE_KNOWN_DISPLAY_UNKNOWN;
-			std::span<const uint32_t> ValidDynamicRefreshRates{};
+			DRMModeGenerator fnDynamicModeGenerator;
+			std::vector<uint32_t> ValidDynamicRefreshRates{};
 			std::vector<uint8_t> EdidData; // Raw, unmodified.
 			std::vector<BackendMode> BackendModes;
 
@@ -401,7 +514,7 @@ namespace gamescope
 	class CDRMFb final : public CBaseBackendFb
 	{
 	public:
-		CDRMFb( uint32_t uFbId, wlr_buffer *pClientBuffer );
+		CDRMFb( uint32_t uFbId );
 		~CDRMFb();
 
 		uint32_t GetFbId() const { return m_uFbId; }
@@ -410,81 +523,6 @@ namespace gamescope
 		uint32_t m_uFbId = 0;
 	};
 }
-
-struct saved_mode {
-	int width;
-	int height;
-	int refresh;
-};
-
-struct drm_t {
-	bool bUseLiftoff;
-
-	int fd = -1;
-
-	int preferred_width, preferred_height, preferred_refresh;
-
-	uint64_t cursor_width, cursor_height;
-	bool allow_modifiers;
-	struct wlr_drm_format_set formats;
-
-	std::vector< std::unique_ptr< gamescope::CDRMPlane > > planes;
-	std::vector< std::unique_ptr< gamescope::CDRMCRTC > > crtcs;
-	std::unordered_map< uint32_t, gamescope::CDRMConnector > connectors;
-
-	gamescope::CDRMPlane *pPrimaryPlane;
-	gamescope::CDRMCRTC *pCRTC;
-	gamescope::CDRMConnector *pConnector;
-
-	struct wlr_drm_format_set primary_formats;
-
-	drmModeAtomicReq *req;
-	uint32_t flags;
-
-	struct liftoff_device *lo_device;
-	struct liftoff_output *lo_output;
-	struct liftoff_layer *lo_layers[ k_nMaxLayers ];
-
-	std::shared_ptr<gamescope::BackendBlob> sdr_static_metadata;
-
-	struct drm_state_t {
-		std::shared_ptr<gamescope::BackendBlob> mode_id;
-		uint32_t color_mgmt_serial;
-		std::shared_ptr<gamescope::BackendBlob> lut3d_id[ EOTF_Count ];
-		std::shared_ptr<gamescope::BackendBlob> shaperlut_id[ EOTF_Count ];
-		amdgpu_transfer_function output_tf = AMDGPU_TRANSFER_FUNCTION_DEFAULT;
-	} current, pending;
-
-	// FBs in the atomic request, but not yet submitted to KMS
-	// Accessed only on req thread
-	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_FbIdsInRequest;
-
-	// FBs currently queued to go on screen.
-	// May be accessed by page flip handler thread and req thread, thus mutex.
-	std::mutex m_QueuedFbIdsMutex;
-	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_QueuedFbIds;
-	// FBs currently on screen.
-	// Accessed only on page flip handler thread.
-	std::vector<gamescope::Rc<gamescope::IBackendFb>> m_VisibleFbIds;
-
-	std::mutex flip_lock;
-
-	std::atomic < bool > paused;
-	std::atomic < int > out_of_date;
-	std::atomic < bool > needs_modeset;
-
-	std::unordered_map< std::string, int > connector_priorities;
-
-	char *device_name = nullptr;
-};
-
-void drm_drop_fbid( struct drm_t *drm, uint32_t fbid );
-bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode );
-
-
-using namespace std::literals;
-
-struct drm_t g_DRM = {};
 
 uint32_t g_nDRMFormat = DRM_FORMAT_INVALID;
 uint32_t g_nDRMFormatOverlay = DRM_FORMAT_INVALID; // for partial composition, we may have more limited formats than base planes + alpha.
@@ -525,8 +563,8 @@ extern GamescopePanelOrientation g_DesiredInternalOrientation;
 
 extern bool g_bForceDisableColorMgmt;
 
-static LogScope drm_log("drm");
-static LogScope drm_verbose_log("drm", LOG_SILENT);
+static LogScope drm_log( "drm" );
+static LogScope liftoff_log_scope( "liftoff" );
 
 static std::unordered_map< std::string, std::string > pnps = {};
 
@@ -550,7 +588,7 @@ static constexpr uint32_t s_kSteamDeckOLEDRates[] =
 	90, 
 };
 
-static void update_connector_display_info_wl(struct drm_t *drm)
+void update_connector_display_info_wl(struct drm_t *drm)
 {
 	wlserver_lock();
 	for ( const auto &control : wlserver.gamescope_controls )
@@ -672,7 +710,7 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	DRMPresentCtx *pCtx = reinterpret_cast<DRMPresentCtx *>( data );
 
 	// Make this const when we move into CDRMBackend.
-	GetBackend()->PresentationFeedback().m_uCompletedPresents = pCtx->ulPendingFlipCount;
+	GetBackend()->GetCurrentConnector()->PresentationFeedback().m_uCompletedPresents = pCtx->ulPendingFlipCount;
 
 	if ( !g_DRM.pCRTC )
 		return;
@@ -680,23 +718,28 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	if ( g_DRM.pCRTC->GetObjectId() != crtc_id )
 		return;
 
+	static uint64_t ulLastVBlankTime = 0;
+
 	// This is the last vblank time
 	uint64_t vblanktime = sec * 1'000'000'000lu + usec * 1'000lu;
 	GetVBlankTimer().MarkVBlank( vblanktime, true );
 
 	// TODO: get the fbids_queued instance from data if we ever have more than one in flight
 
-	drm_verbose_log.debugf("page_flip_handler %" PRIu64, pCtx->ulPendingFlipCount);
+	drm_log.debugf("page_flip_handler %" PRIu64 " delta: %" PRIu64, pCtx->ulPendingFlipCount, vblanktime - ulLastVBlankTime );
 	gpuvis_trace_printf("page_flip_handler %" PRIu64, pCtx->ulPendingFlipCount);
 
+	ulLastVBlankTime = vblanktime;
+
 	{
-		std::unique_lock lock( g_DRM.m_QueuedFbIdsMutex );
+		std::scoped_lock lock{ g_DRM.m_QueuedFbIdsMutex, g_DRM.m_mutVisibleFbIds };
 		// Swap and clear from queue -> visible to avoid allocations.
 		g_DRM.m_VisibleFbIds.swap( g_DRM.m_QueuedFbIds );
 		g_DRM.m_QueuedFbIds.clear();
 	}
 
-	g_DRM.flip_lock.unlock();
+	g_DRM.uPendingFlipCount--;
+	g_DRM.uPendingFlipCount.notify_all();
 
 	mangoapp_output_update( vblanktime );
 
@@ -748,12 +791,23 @@ static bool refresh_state( drm_t *drm )
 		if ( !pConnector )
 			continue;
 
+		if ( cv_drm_ignore_internal_connectors )
+		{
+			if ( pConnector->connector_type == DRM_MODE_CONNECTOR_eDP ||
+				pConnector->connector_type == DRM_MODE_CONNECTOR_LVDS ||
+				pConnector->connector_type == DRM_MODE_CONNECTOR_DSI )
+			{
+				drmModeFreeConnector( pConnector );
+				continue;
+			}
+		}
+
 		if ( !drm->connectors.contains( uConnectorId ) )
 		{
 			drm->connectors.emplace(
 				std::piecewise_construct,
 				std::forward_as_tuple( uConnectorId ),
-				std::forward_as_tuple( pConnector ) );
+				std::forward_as_tuple( reinterpret_cast<gamescope::CDRMBackend *>( GetBackend() ), pConnector ) );
 		}
 	}
 
@@ -1021,6 +1075,9 @@ static bool setup_best_connector(struct drm_t *drm, bool force, bool initial)
 		return false;
 	}
 
+	// Don't allow rollback of mode_id after connector change
+	drm->current.mode_id = drm->pending.mode_id;
+
 	const struct wlserver_output_info wlserver_output_info = {
 		.description = description,
 		.phys_width = (int) best->GetModeConnector()->mmWidth,
@@ -1076,6 +1133,27 @@ extern bool env_to_bool(const char *env);
 
 uint32_t g_uAlwaysSignalledSyncobj = 0;
 int g_nAlwaysSignalledSyncFile = -1;
+
+static void
+gamescope_liftoff_log_handler(enum liftoff_log_priority liftoff_priority, const char *fmt, va_list args)
+{
+	enum LogPriority priority = LOG_DEBUG;
+	
+	switch ( liftoff_priority )
+	{
+		case LIFTOFF_ERROR:
+			priority = LOG_ERROR;
+			break;
+		case LIFTOFF_DEBUG:
+			priority = LOG_DEBUG;
+			break;
+		case LIFTOFF_SILENT:
+			priority = LOG_SILENT;
+			break;
+	}
+
+	liftoff_log_scope.vlogf(priority, fmt, args);
+}
 
 bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 {
@@ -1250,8 +1328,9 @@ bool init_drm(struct drm_t *drm, int width, int height, int refresh)
 	std::thread flip_handler_thread( flip_handler_thread_run );
 	flip_handler_thread.detach();
 
-	if ( drm->bUseLiftoff )
-		liftoff_log_set_priority(g_bDebugLayers ? LIFTOFF_DEBUG : LIFTOFF_ERROR);
+	// Set log priority to the max, liftoff_log_scope will filter for us.
+	liftoff_log_set_priority(LIFTOFF_DEBUG);
+	liftoff_log_set_handler(gamescope_liftoff_log_handler);
 
 	hdr_output_metadata sdr_metadata;
 	memset(&sdr_metadata, 0, sizeof(sdr_metadata));
@@ -1386,7 +1465,7 @@ void finish_drm(struct drm_t *drm)
 		drm->m_QueuedFbIds.clear();
 	}
 	{
-		std::unique_lock lock( drm->flip_lock );
+		std::unique_lock lock( drm->m_mutVisibleFbIds );
 		drm->m_VisibleFbIds.clear();
 	}
 	drm->sdr_static_metadata = nullptr;
@@ -1409,7 +1488,7 @@ gamescope::OwningRc<gamescope::IBackendFb> drm_fbid_from_dmabuf( struct drm_t *d
 
 	if ( !wlr_drm_format_set_has( &drm->formats, dma_buf->format, dma_buf->modifier ) )
 	{
-		drm_verbose_log.errorf( "Cannot import FB to DRM: format 0x%" PRIX32 " and modifier 0x%" PRIX64 " not supported for scan-out", dma_buf->format, dma_buf->modifier );
+		drm_log.errorf( "Cannot import FB to DRM: format 0x%" PRIX32 " and modifier 0x%" PRIX64 " not supported for scan-out", dma_buf->format, dma_buf->modifier );
 		return nullptr;
 	}
 
@@ -1449,9 +1528,9 @@ gamescope::OwningRc<gamescope::IBackendFb> drm_fbid_from_dmabuf( struct drm_t *d
 		}
 	}
 
-	drm_verbose_log.debugf("make fbid %u", fb_id);
+	drm_log.debugf("make fbid %u", fb_id);
 
-	pBackendFb = new gamescope::CDRMFb( fb_id, buf );
+	pBackendFb = new gamescope::CDRMFb( fb_id );
 
 out:
 	for ( int i = 0; i < dma_buf->n_planes; i++ ) {
@@ -1923,8 +2002,9 @@ namespace gamescope
 	/////////////////////////
 	// CDRMConnector
 	/////////////////////////
-	CDRMConnector::CDRMConnector( drmModeConnector *pConnector )
+	CDRMConnector::CDRMConnector( CDRMBackend *pBackend, drmModeConnector *pConnector )
 		: CDRMAtomicTypedObject<DRM_MODE_OBJECT_CONNECTOR>( pConnector->connector_id )
+		, m_pBackend{ pBackend }
 		, m_pConnector{ pConnector, []( drmModeConnector *pConnector ){ drmModeFreeConnector( pConnector ); } }
 	{
 		RefreshState();
@@ -2001,6 +2081,11 @@ namespace gamescope
 		}
 
 		ParseEDID();
+	}
+
+	int CDRMConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
+	{
+		return HackyDRMPresent( pFrameInfo, bAsync );
 	}
 
 	void CDRMConnector::UpdateEffectiveOrientation( const drmModeModeInfo *pMode )
@@ -2088,69 +2173,158 @@ namespace gamescope
 		for ( size_t i = 0; pDescriptors[i] != nullptr; i++ )
 		{
 			const di_edid_display_descriptor *pDesc = pDescriptors[i];
-			if ( di_edid_display_descriptor_get_tag( pDesc ) == DI_EDID_DISPLAY_DESCRIPTOR_PRODUCT_NAME )
+			const di_edid_display_descriptor_tag eTag = di_edid_display_descriptor_get_tag( pDesc );
+			if ( eTag == DI_EDID_DISPLAY_DESCRIPTOR_PRODUCT_NAME )
 			{
 				// Max length of di_edid_display_descriptor_get_string is 14
 				// m_szModel is 16 bytes.
 				const char *pszModel = di_edid_display_descriptor_get_string( pDesc );
 				strncpy( m_Mutable.szModel, pszModel, sizeof( m_Mutable.szModel ) );
 			}
+			else if ( eTag == DI_EDID_DISPLAY_DESCRIPTOR_DATA_STRING )
+			{
+				const char *pszDataString = di_edid_display_descriptor_get_string( pDesc );
+				strncpy( m_Mutable.szDataString, pszDataString, sizeof( m_Mutable.szDataString ) );
+			}
 		}
 
 		drm_log.infof("Connector %s -> %s - %s", m_Mutable.szName, m_Mutable.szMakePNP, m_Mutable.szModel );
 
-		const bool bSteamDeckDisplay =
-			( m_Mutable.szMakePNP == "WLC"sv && m_Mutable.szModel == "ANX7530 U"sv ) ||
-			( m_Mutable.szMakePNP == "ANX"sv && m_Mutable.szModel == "ANX7530 U"sv ) ||
-			( m_Mutable.szMakePNP == "VLV"sv && m_Mutable.szModel == "ANX7530 U"sv ) ||
-			( m_Mutable.szMakePNP == "VLV"sv && m_Mutable.szModel == "Jupiter"sv ) ||
-			( m_Mutable.szMakePNP == "VLV"sv && m_Mutable.szModel == "Galileo"sv );
+		bool bHasKnownColorimetry = false;
+		bool bHasKnownHDRInfo = false;
 
-		if ( bSteamDeckDisplay )
+		m_Mutable.ValidDynamicRefreshRates.clear();
+		m_Mutable.fnDynamicModeGenerator = nullptr;
 		{
-			static constexpr uint32_t kPIDGalileoSDC = 0x3003;
-			static constexpr uint32_t kPIDGalileoBOE = 0x3004;
+			CScriptScopedLock script;
 
-			if ( pProduct->product == kPIDGalileoSDC )
+			auto oKnownDisplay = script.Manager().Gamescope().Config.LookupDisplay( script, m_Mutable.szMakePNP, pProduct->product, m_Mutable.szModel, m_Mutable.szDataString );
+			if ( oKnownDisplay )
 			{
-				m_Mutable.eKnownDisplay = GAMESCOPE_KNOWN_DISPLAY_STEAM_DECK_OLED_SDC;
-				m_Mutable.ValidDynamicRefreshRates = std::span( s_kSteamDeckOLEDRates );
-			}
-			else if ( pProduct->product == kPIDGalileoBOE )
-			{
-				m_Mutable.eKnownDisplay = GAMESCOPE_KNOWN_DISPLAY_STEAM_DECK_OLED_BOE;
-				m_Mutable.ValidDynamicRefreshRates = std::span( s_kSteamDeckOLEDRates );
+				sol::table tTable = oKnownDisplay->second;
+
+				std::string_view psvPrettyName = tTable.get_or( "pretty_name", std::string_view{ "Untitled Display" } );
+				drm_log.infof( "Got known display: %.*s (%.*s)",
+					(int)oKnownDisplay->first.size(), oKnownDisplay->first.data(),
+					(int)psvPrettyName.size(), psvPrettyName.data() );
+
+
+				sol::optional<sol::table> otDynamicRefreshRates = tTable["dynamic_refresh_rates"];
+				sol::optional<sol::function> ofnDynamicModegen = tTable["dynamic_modegen"];
+
+				if ( otDynamicRefreshRates && ofnDynamicModegen )
+				{
+					m_Mutable.ValidDynamicRefreshRates = TableToVector<uint32_t>( *otDynamicRefreshRates );
+
+					m_Mutable.fnDynamicModeGenerator = [ fnDynamicModegen = *ofnDynamicModegen ]( const drmModeModeInfo *pBaseMode, int nRefreshHz ) -> drmModeModeInfo
+					{
+						CScriptScopedLock script;
+
+						sol::table tInMode = script->create_table();
+						tInMode["clock"] = pBaseMode->clock;
+
+						tInMode["hdisplay"] = pBaseMode->hdisplay;
+						tInMode["hsync_start"] = pBaseMode->hsync_start;
+						tInMode["hsync_end"] = pBaseMode->hsync_end;
+						tInMode["htotal"] = pBaseMode->htotal;
+
+						tInMode["vdisplay"] = pBaseMode->vdisplay;
+						tInMode["vsync_start"] = pBaseMode->vsync_start;
+						tInMode["vsync_end"] = pBaseMode->vsync_end;
+						tInMode["vtotal"] = pBaseMode->vtotal;
+
+						tInMode["vrefresh"] = pBaseMode->vrefresh;
+
+						sol::function_result ret = fnDynamicModegen(tInMode, nRefreshHz);
+						if ( !ret.valid() || !ret.get<sol::table>() )
+							return *pBaseMode;
+						
+						sol::table tOutMode = ret;
+
+						drmModeModeInfo outMode = *pBaseMode;
+						outMode.clock = tOutMode["clock"];
+
+						outMode.hdisplay = tOutMode["hdisplay"];
+						outMode.hsync_start = tOutMode["hsync_start"];
+						outMode.hsync_end = tOutMode["hsync_end"];
+						outMode.htotal = tOutMode["htotal"];
+
+						outMode.vdisplay = tOutMode["vdisplay"];
+						outMode.vsync_start = tOutMode["vsync_start"];
+						outMode.vsync_end = tOutMode["vsync_end"];
+						outMode.vtotal = tOutMode["vtotal"];
+
+						outMode.vrefresh = tOutMode["vrefresh"];
+
+						snprintf( outMode.name, sizeof( outMode.name ), "%dx%d@%d.00", outMode.hdisplay, outMode.vdisplay, nRefreshHz );
+
+						return outMode;
+					};
+				}
+
+				if ( sol::optional<sol::table> otColorimetry = tTable["colorimetry"] )
+				{
+					sol::table tColorimetry = *otColorimetry;
+
+					// TODO: Add a vec2 + colorimetry type?
+					sol::optional<sol::table> otR = tColorimetry["r"];
+					sol::optional<sol::table> otG = tColorimetry["g"];
+					sol::optional<sol::table> otB = tColorimetry["b"];
+					sol::optional<sol::table> otW = tColorimetry["w"];
+
+					if ( otR && otG && otB && otW )
+					{
+						m_Mutable.DisplayColorimetry.primaries.r = TableToVec<glm::vec2>( *otR );
+						m_Mutable.DisplayColorimetry.primaries.g = TableToVec<glm::vec2>( *otG );
+						m_Mutable.DisplayColorimetry.primaries.b = TableToVec<glm::vec2>( *otB );
+						m_Mutable.DisplayColorimetry.white = TableToVec<glm::vec2>( *otW );
+
+						bHasKnownColorimetry = true;
+					}
+				}
+
+				if ( sol::optional<sol::table> otHDRInfo = tTable["hdr"] )
+				{
+					m_Mutable.HDR.bExposeHDRSupport = otHDRInfo->get_or( "supported", false );
+					m_Mutable.HDR.eOutputEncodingEOTF = otHDRInfo->get_or( "eotf", EOTF_Gamma22 );
+					m_Mutable.HDR.uMaxContentLightLevel = nits_to_u16( otHDRInfo->get_or( "max_content_light_level", 400.0f ) );
+					m_Mutable.HDR.uMaxFrameAverageLuminance = nits_to_u16( otHDRInfo->get_or( "max_frame_average_luminance", 400.0f ) );
+					m_Mutable.HDR.uMinContentLightLevel = nits_to_u16_dark( otHDRInfo->get_or( "min_content_light_level", 0.1f ) );
+
+					bHasKnownHDRInfo = true;
+				}
 			}
 			else
 			{
-				m_Mutable.eKnownDisplay = GAMESCOPE_KNOWN_DISPLAY_STEAM_DECK_LCD;
-				m_Mutable.ValidDynamicRefreshRates = std::span( s_kSteamDeckLCDRates );
+				// Unknown display, see if there are any other refresh rates in the EDID we can get.
+				if ( GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL || cv_drm_allow_dynamic_modes_for_external_display )
+				{
+					const drmModeModeInfo *pPreferredMode = find_mode( m_pConnector.get(), 0, 0, 0 );
+
+					if ( pPreferredMode )
+					{
+						// See if the EDID has any modes for us.
+						for (int i = 0; i < m_pConnector->count_modes; i++)
+						{
+							const drmModeModeInfo *pMode = &m_pConnector->modes[i];
+
+							if ( pMode->hdisplay != pPreferredMode->hdisplay || pMode->vdisplay != pPreferredMode->vdisplay )
+								continue;
+
+							
+							if ( !Algorithm::Contains( m_Mutable.ValidDynamicRefreshRates, pMode->vrefresh ) )
+							{
+								m_Mutable.ValidDynamicRefreshRates.push_back( pMode->vrefresh );
+							}
+						}
+
+						std::sort( m_Mutable.ValidDynamicRefreshRates.begin(), m_Mutable.ValidDynamicRefreshRates.end() );
+					}
+				}
 			}
 		}
 
-		// Colorimetry
-		const char *pszColorOverride = getenv( "GAMESCOPE_INTERNAL_COLORIMETRY_OVERRIDE" );
-		if ( pszColorOverride && *pszColorOverride && GetScreenType() == GAMESCOPE_SCREEN_TYPE_INTERNAL )
-		{
-			if ( sscanf( pszColorOverride, "%f %f %f %f %f %f %f %f",
-				&m_Mutable.DisplayColorimetry.primaries.r.x, &m_Mutable.DisplayColorimetry.primaries.r.y,
-				&m_Mutable.DisplayColorimetry.primaries.g.x, &m_Mutable.DisplayColorimetry.primaries.g.y,
-				&m_Mutable.DisplayColorimetry.primaries.b.x, &m_Mutable.DisplayColorimetry.primaries.b.y,
-				&m_Mutable.DisplayColorimetry.white.x, &m_Mutable.DisplayColorimetry.white.y ) == 8 )
-			{
-				drm_log.infof( "[colorimetry]: GAMESCOPE_INTERNAL_COLORIMETRY_OVERRIDE detected" );
-			}
-			else
-			{
-				drm_log.errorf( "[colorimetry]: GAMESCOPE_INTERNAL_COLORIMETRY_OVERRIDE specified, but could not parse \"rx ry gx gy bx by wx wy\"" );
-			}
-		}
-		else if ( m_Mutable.eKnownDisplay == GAMESCOPE_KNOWN_DISPLAY_STEAM_DECK_LCD )
-		{
-			drm_log.infof( "[colorimetry]: Steam Deck LCD detected. Using known colorimetry" );
-			m_Mutable.DisplayColorimetry = displaycolorimetry_steamdeck_measured;
-		}
-		else
+		if ( !bHasKnownColorimetry )
 		{
 			// Steam Deck OLED has calibrated chromaticity coordinates in the EDID
 			// for each unit.
@@ -2166,6 +2340,11 @@ namespace gamescope
 					.white = { pChroma->white_x, pChroma->white_y },
 				};
 			}
+			else
+			{
+				// Assume 709 if we have no data at all.
+				m_Mutable.DisplayColorimetry = displaycolorimetry_709;
+			}
 		}
 
 		drm_log.infof( "[colorimetry]: r %f %f", m_Mutable.DisplayColorimetry.primaries.r.x, m_Mutable.DisplayColorimetry.primaries.r.y );
@@ -2176,12 +2355,7 @@ namespace gamescope
 		/////////////////////
 		// Parse HDR stuff.
 		/////////////////////
-		std::optional<BackendConnectorHDRInfo> oKnownHDRInfo = GetKnownDisplayHDRInfo( m_Mutable.eKnownDisplay );
-		if ( oKnownHDRInfo )
-		{
-			m_Mutable.HDR = *oKnownHDRInfo;
-		}
-		else
+		if ( !bHasKnownHDRInfo )
 		{
 			const di_cta_hdr_static_metadata_block *pHDRStaticMetadata = nullptr;
 			const di_cta_colorimetry_block *pColorimetry = nullptr;
@@ -2264,44 +2438,11 @@ namespace gamescope
 		}
 	}
 
-	/*static*/ std::optional<BackendConnectorHDRInfo> CDRMConnector::GetKnownDisplayHDRInfo( GamescopeKnownDisplays eKnownDisplay )
-	{
-		if ( eKnownDisplay == GAMESCOPE_KNOWN_DISPLAY_STEAM_DECK_OLED_BOE || eKnownDisplay == GAMESCOPE_KNOWN_DISPLAY_STEAM_DECK_OLED_SDC )
-		{
-			// The stuff in the EDID for the HDR metadata does not fully
-			// reflect what we can achieve on the display by poking at more
-			// things out-of-band.
-			return BackendConnectorHDRInfo
-			{
-				.bExposeHDRSupport = true,
-				.eOutputEncodingEOTF = EOTF_Gamma22,
-				.uMaxContentLightLevel = nits_to_u16( 1000.0f ),
-				.uMaxFrameAverageLuminance = nits_to_u16( 800.0f ), // Full-frame sustained.
-				.uMinContentLightLevel = nits_to_u16_dark( 0 ),
-			};
-		}
-		else if ( eKnownDisplay == GAMESCOPE_KNOWN_DISPLAY_STEAM_DECK_LCD )
-		{
-			// Set up some HDR fallbacks for undocking
-			return BackendConnectorHDRInfo
-			{
-				.bExposeHDRSupport = false,
-				.eOutputEncodingEOTF = EOTF_Gamma22,
-				.uMaxContentLightLevel = nits_to_u16( 500.0f ),
-				.uMaxFrameAverageLuminance = nits_to_u16( 500.0f ),
-				.uMinContentLightLevel = nits_to_u16_dark( 0.5f ),
-			};
-		}
-
-		return std::nullopt;
-	}
-
 	/////////////////////////
 	// CDRMFb
 	/////////////////////////
-	CDRMFb::CDRMFb( uint32_t uFbId, wlr_buffer *pClientBuffer )
-		: CBaseBackendFb( pClientBuffer )
-		, m_uFbId{ uFbId }
+	CDRMFb::CDRMFb( uint32_t uFbId )
+		: m_uFbId{ uFbId }
 	{
 
 	}
@@ -2342,7 +2483,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 
 			if ( pDrmFb == nullptr )
 			{
-				drm_verbose_log.errorf("drm_prepare_liftoff: layer %d has no FB", i );
+				drm_log.debugf("drm_prepare_liftoff: layer %d has no FB", i );
 				return -EINVAL;
 			}
 
@@ -2388,14 +2529,23 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 
 			if ( frameInfo->layers[i].applyColorMgmt )
 			{
-				if ( entry.layerState[i].ycbcr )
+				bool bYCbCr = entry.layerState[i].ycbcr;
+
+				if ( !cv_drm_debug_disable_color_encoding && bYCbCr )
 				{
 					liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_ENCODING", entry.layerState[i].colorEncoding );
-					liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_RANGE",    entry.layerState[i].colorRange );
 				}
 				else
 				{
 					liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_ENCODING" );
+				}
+
+				if ( !cv_drm_debug_disable_color_range && bYCbCr )
+				{
+					liftoff_layer_set_property( drm->lo_layers[ i ], "COLOR_RANGE",    entry.layerState[i].colorRange );
+				}
+				else
+				{
 					liftoff_layer_unset_property( drm->lo_layers[ i ], "COLOR_RANGE" );
 				}
 
@@ -2404,7 +2554,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 					amdgpu_transfer_function degamma_tf = colorspace_to_plane_degamma_tf( entry.layerState[i].colorspace );
 					amdgpu_transfer_function shaper_tf = colorspace_to_plane_shaper_tf( entry.layerState[i].colorspace );
 
-					if ( entry.layerState[i].ycbcr )
+					if ( bYCbCr )
 					{
 						// JoshA: Based on the Steam In-Home Streaming Shader,
 						// it looks like Y is actually sRGB, not HDTV G2.4
@@ -2414,16 +2564,18 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 						//
 						// Doing LINEAR/DEFAULT here introduces banding so... this is the best way.
 						// (sRGB DEGAMMA does NOT work on YUV planes!)
-						degamma_tf = AMDGPU_TRANSFER_FUNCTION_BT709_OETF;
-						shaper_tf = AMDGPU_TRANSFER_FUNCTION_BT709_INV_OETF;
+						degamma_tf = AMDGPU_TRANSFER_FUNCTION_BT709_INV_OETF;
+						shaper_tf = AMDGPU_TRANSFER_FUNCTION_BT709_OETF;
 					}
 
-					if (!cv_drm_debug_disable_degamma_tf)
+					bool bUseDegamma = !cv_drm_debug_disable_degamma_tf;
+					if ( bUseDegamma )
 						liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_DEGAMMA_TF", degamma_tf );
 					else
 						liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_DEGAMMA_TF", 0 );
 
-					if ( !cv_drm_debug_disable_shaper_and_3dlut )
+					bool bUseShaperAnd3DLUT = !cv_drm_debug_disable_shaper_and_3dlut;
+					if ( bUseShaperAnd3DLUT )
 					{
 						liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_LUT", drm->pending.shaperlut_id[ ColorSpaceToEOTFIndex( entry.layerState[i].colorspace ) ]->GetBlobValue() );
 						liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_SHAPER_TF", shaper_tf );
@@ -2457,7 +2609,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 				else
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_BLEND_TF", AMDGPU_TRANSFER_FUNCTION_DEFAULT );
 
-				if (frameInfo->layers[i].ctm != nullptr)
+				if (!cv_drm_debug_disable_ctm && frameInfo->layers[i].ctm != nullptr)
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", frameInfo->layers[i].ctm->GetBlobValue() );
 				else
 					liftoff_layer_set_property( drm->lo_layers[ i ], "AMD_PLANE_CTM", 0 );
@@ -2531,9 +2683,9 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 	}
 
 	if ( ret == 0 )
-		drm_verbose_log.debugf( "can drm present %i layers", frameInfo->layerCount );
+		drm_log.debugf( "can drm present %i layers", frameInfo->layerCount );
 	else
-		drm_verbose_log.debugf( "can NOT drm present %i layers", frameInfo->layerCount );
+		drm_log.debugf( "can NOT drm present %i layers", frameInfo->layerCount );
 
 	return ret;
 }
@@ -2577,12 +2729,16 @@ void drm_rollback( struct drm_t *drm )
  * negative errno on failure or if the scene-graph can't be presented directly. */
 int drm_prepare( struct drm_t *drm, bool async, const struct FrameInfo_t *frameInfo )
 {
+	if ( !drm->pConnector )
+		return -EACCES;
+
 	drm_update_color_mgmt(drm);
 
-	const bool bVRRCapable = drm->pConnector && drm->pConnector->GetProperties().vrr_capable &&
-							 drm->pCRTC && drm->pCRTC->GetProperties().VRR_ENABLED;
-	const bool bVRREnabled = bVRRCapable && frameInfo->allowVRR;
-	if ( bVRRCapable )
+	const bool bIsVRRCapable = drm->pConnector && drm->pConnector->GetProperties().vrr_capable && !!drm->pConnector->GetProperties().vrr_capable->GetCurrentValue();
+	const bool bHasVRREnable = drm->pCRTC && drm->pCRTC->GetProperties().VRR_ENABLED;
+
+	const bool bVRREnabled = bIsVRRCapable && bHasVRREnable && frameInfo->allowVRR;
+	if ( bIsVRRCapable )
 	{
 		if ( bVRREnabled != !!drm->pCRTC->GetProperties().VRR_ENABLED->GetCurrentValue() )
 			drm->needs_modeset = true;
@@ -2827,6 +2983,11 @@ bool drm_set_connector( struct drm_t *drm, gamescope::CDRMConnector *conn )
 		return false;
 	}
 
+	// If we are changing connector, zero out the current and pending mode IDs.
+	// So we don't try to use one mode from the old connector on the new one if we roll back.
+	drm->pending.mode_id = nullptr;
+	drm->current.mode_id = nullptr;
+
 	drm->pConnector = conn;
 	drm->needs_modeset = true;
 
@@ -2895,6 +3056,8 @@ bool drm_update_color_mgmt(struct drm_t *drm)
 	return true;
 }
 
+int g_nDynamicRefreshHz = 0;
+
 static void drm_unset_mode( struct drm_t *drm )
 {
 	drm->pending.mode_id = 0;
@@ -2910,6 +3073,7 @@ static void drm_unset_mode( struct drm_t *drm )
 	g_nOutputRefresh = drm->preferred_refresh;
 	if (g_nOutputRefresh == 0)
 		g_nOutputRefresh = gamescope::ConvertHztomHz( 60 );
+	g_nDynamicRefreshHz = 0;
 
 	g_bRotated = false;
 }
@@ -2925,6 +3089,7 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 	drm->needs_modeset = true;
 
 	g_nOutputRefresh = gamescope::GetModeRefresh( mode );
+	g_nDynamicRefreshHz = 0;
 
 	update_drm_effective_orientations(drm, mode);
 
@@ -2970,24 +3135,38 @@ bool drm_set_refresh( struct drm_t *drm, int refresh )
 	}
 	else
 	{
-		/* TODO: check refresh is within the EDID limits */
-		switch ( g_eGamescopeModeGeneration )
+		if ( g_DRM.pConnector && g_DRM.pConnector->GetModeGenerator() )
 		{
-		case gamescope::GAMESCOPE_MODE_GENERATE_CVT:
-			generate_cvt_mode( &mode, width, height, refresh, true, false );
-			break;
-		case gamescope::GAMESCOPE_MODE_GENERATE_FIXED:
+			const drmModeModeInfo *preferred_mode = find_mode(connector, 0, 0, 0);
+			mode = g_DRM.pConnector->GetModeGenerator()( preferred_mode, refresh );
+		}
+		else
+		{
+			/* TODO: check refresh is within the EDID limits */
+			switch ( g_eGamescopeModeGeneration )
 			{
-				const drmModeModeInfo *preferred_mode = find_mode(connector, 0, 0, 0);
-				generate_fixed_mode( &mode, preferred_mode, refresh, drm->pConnector->GetKnownDisplayType() );
+			case gamescope::GAMESCOPE_MODE_GENERATE_CVT:
+				generate_cvt_mode( &mode, width, height, refresh, true, false );
 				break;
+			case gamescope::GAMESCOPE_MODE_GENERATE_FIXED:
+				{
+					const drmModeModeInfo *preferred_mode = find_mode(connector, 0, 0, 0);
+					generate_fixed_mode( &mode, preferred_mode, refresh );
+					break;
+				}
 			}
 		}
 	}
 
 	mode.type = DRM_MODE_TYPE_USERDEF;
 
-	return drm_set_mode(drm, &mode);
+	bool bSuccess = drm_set_mode(drm, &mode);
+	if ( !bSuccess )
+		return false;
+
+	g_nDynamicRefreshHz = refresh;
+
+	return true;
 }
 
 bool drm_set_resolution( struct drm_t *drm, int width, int height )
@@ -3123,18 +3302,23 @@ namespace gamescope
 			// thus: newLayout is ignored.
 			return VK_IMAGE_LAYOUT_GENERAL;
 		}
-        virtual void GetPreferredOutputFormat( VkFormat *pPrimaryPlaneFormat, VkFormat *pOverlayPlaneFormat ) const override
+        virtual void GetPreferredOutputFormat( uint32_t *pPrimaryPlaneFormat, uint32_t *pOverlayPlaneFormat ) const override
         {
-			*pPrimaryPlaneFormat = DRMFormatToVulkan( g_nDRMFormat, false );
-			*pOverlayPlaneFormat = DRMFormatToVulkan( g_nDRMFormatOverlay, false );
+			*pPrimaryPlaneFormat = g_nDRMFormat;
+			*pOverlayPlaneFormat = g_nDRMFormatOverlay;
         }
 		virtual bool ValidPhysicalDevice( VkPhysicalDevice pVkPhysicalDevice ) const override
 		{
 			return true;
 		}
 
-		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override
+		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync )
 		{
+			static uint64_t s_ulLastTime = get_time_in_nanos();
+			uint64_t ulNow = get_time_in_nanos();
+			drm_log.debugf( "CDRMBackend::Present Begin: %lu -> delta: %lu", ulNow, ulNow - s_ulLastTime );
+			s_ulLastTime = ulNow;
+
 			bool bWantsPartialComposite = pFrameInfo->layerCount >= 3 && !kDisablePartialComposition;
 
 			static bool s_bWasFirstFrame = true;
@@ -3378,7 +3562,7 @@ namespace gamescope
 				if ( g_DRM.current.mode_id == 0 )
 				{
 					xwm_log.errorf("We failed our modeset and have no mode to fall back to! (Initial modeset failed?): %s", strerror(-ret));
-					abort();
+					return 0;
 				}
 
 				xwm_log.errorf("Failed to prepare 1-layer flip (%s), trying again with previous mode if modeset needed", strerror( -ret ));
@@ -3487,14 +3671,6 @@ namespace gamescope
 			return nullptr;
 		}
 
-		virtual bool IsVRRActive() const override
-		{
-			if ( !g_DRM.pCRTC || !g_DRM.pCRTC->GetProperties().VRR_ENABLED )
-				return false;
-
-			return !!g_DRM.pCRTC->GetProperties().VRR_ENABLED->GetCurrentValue();
-		}
-
 		virtual bool SupportsPlaneHardwareCursor() const override
 		{
 			return true;
@@ -3591,10 +3767,11 @@ namespace gamescope
 			defer( if ( drm->req != nullptr ) { drmModeAtomicFree( drm->req ); drm->req = nullptr; } );
 
 			bool isPageFlip = drm->flags & DRM_MODE_PAGE_FLIP_EVENT;
+			uint32_t uNewPendingFlipCount = 0;
 
 			if ( isPageFlip )
 			{
-				drm->flip_lock.lock();
+				uNewPendingFlipCount = ++drm->uPendingFlipCount;
 
 				// Do it before the commit, as otherwise the pageflip handler could
 				// potentially beat us to the refcount checks.
@@ -3604,14 +3781,14 @@ namespace gamescope
 				drm->m_QueuedFbIds.swap( drm->m_FbIdsInRequest );
 			}
 
-			m_PresentFeedback.m_uQueuedPresents++;
+			GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents++;
 
 			uint32_t uCurrentPresentCtx = m_uNextPresentCtx;
 			m_uNextPresentCtx = ( m_uNextPresentCtx + 1 ) % 3;
-			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = m_PresentFeedback.m_uQueuedPresents;
+			m_PresentCtxs[uCurrentPresentCtx].ulPendingFlipCount = GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents;
 
-			drm_verbose_log.debugf("flip commit %" PRIu64, (uint64_t)m_PresentFeedback.m_uQueuedPresents);
-			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)m_PresentFeedback.m_uQueuedPresents );
+			drm_log.debugf("flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents);
+			gpuvis_trace_printf( "flip commit %" PRIu64, (uint64_t)GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents );
 
 			ret = drmModeAtomicCommit(drm->fd, drm->req, drm->flags, &m_PresentCtxs[uCurrentPresentCtx] );
 			if ( ret != 0 )
@@ -3622,7 +3799,7 @@ namespace gamescope
 				{
 					drm_log.errorf( "fatal flip error, aborting" );
 					if ( isPageFlip )
-						drm->flip_lock.unlock();
+						drm->uPendingFlipCount--;
 					abort();
 				}
 
@@ -3637,10 +3814,10 @@ namespace gamescope
 				// Clear our refs.
 				drm->m_FbIdsInRequest.clear();
 
-				m_PresentFeedback.m_uQueuedPresents--;
+				GetCurrentConnector()->PresentationFeedback().m_uQueuedPresents--;
 
 				if ( isPageFlip )
-					drm->flip_lock.unlock();
+					drm->uPendingFlipCount--;
 
 				return ret;
 			} else {
@@ -3688,9 +3865,9 @@ namespace gamescope
 
 			if ( isPageFlip )
 			{
-				// Wait for flip handler to unlock
-				drm->flip_lock.lock();
-				drm->flip_lock.unlock();
+				// Wait for bPendingFlip to change from true -> false.
+				drm->uPendingFlipCount.wait( uNewPendingFlipCount );
+				assert( drm->uPendingFlipCount == 0 );
 			}
 
 			return ret;
@@ -3708,3 +3885,9 @@ namespace gamescope
 		return Set( new CDRMBackend{} );
 	}
 }
+
+int HackyDRMPresent( const FrameInfo_t *pFrameInfo, bool bAsync )
+{
+	return static_cast<gamescope::CDRMBackend *>( GetBackend() )->Present( pFrameInfo, bAsync );
+}
+

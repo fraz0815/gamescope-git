@@ -3,6 +3,7 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #include "vkroots.h"
 #include "xcb_helpers.hpp"
+#include "vulkan_operators.hpp"
 #include "gamescope-swapchain-client-protocol.h"
 #include "../src/color_helpers.h"
 #include "../src/layer_defines.h"
@@ -90,6 +91,172 @@ namespace GamescopeWSILayer {
     return atoi(appid);
   }
 
+  static const char* gamescopeWaylandSocket() {
+    return std::getenv("GAMESCOPE_WAYLAND_DISPLAY");
+  }
+
+  static bool isAppInfoGamescope(const VkApplicationInfo *appInfo) {
+    if (!appInfo || !appInfo->pApplicationName)
+      return false;
+
+    return appInfo->pApplicationName == "gamescope"sv;
+  }
+
+  static bool isRunningUnderGamescope() {
+    static bool s_isRunningUnderGamescope = []() -> bool {
+      const char *gamescopeSocketName = gamescopeWaylandSocket();
+      if (!gamescopeSocketName || !*gamescopeSocketName)
+        return false;
+
+      // Gamescope always sets or unsets WAYLAND_SOCKET.
+      // So if that is set to something else, we know we cannot be running
+      // under Gamescope and must be in a nested Wayland session inside of gamescope.
+      const char *waylandSocketName = std::getenv("WAYLAND_DISPLAY");
+      if (waylandSocketName && *waylandSocketName && strcmp(gamescopeSocketName, waylandSocketName) != 0)
+        return false;
+
+      return true;
+    }();
+
+    return s_isRunningUnderGamescope;
+  }
+
+  template <typename T>
+  std::optional<T> parseEnv(const char *envName) {
+    const char *str = std::getenv(envName);
+    if (!str || !*str)
+      return std::nullopt;
+
+    T value;
+    auto result = std::from_chars(str, str + strlen(str), value);
+    if (result.ec != std::errc{})
+      return std::nullopt;
+
+    return value;
+  }
+
+  template <>
+  std::optional<bool> parseEnv(const char *envName) {
+    const char *str = std::getenv(envName);
+    if (!str || !*str)
+      return std::nullopt;
+
+    if (str == "true"sv || str == "1"sv)
+      return true;
+
+    return false;
+  }
+
+  static uint32_t getMinImageCount() {
+    static uint32_t s_minImageCount = []() -> uint32_t {
+      if (auto minCount = parseEnv<uint32_t>("GAMESCOPE_WSI_MIN_IMAGE_COUNT")) {
+        fprintf(stderr, "[Gamescope WSI] minImageCount overridden by GAMESCOPE_WSI_MIN_IMAGE_COUNT: %u\n", *minCount);
+        return *minCount;
+      }
+
+      if (auto minCount = parseEnv<uint32_t>("vk_wsi_override_min_image_count")) {
+        fprintf(stderr, "[Gamescope WSI] minImageCount overridden by vk_wsi_override_min_image_count: %u\n", *minCount);
+        return *minCount;
+      }
+
+      if (auto minCount = parseEnv<uint32_t>("vk_x11_override_min_image_count")) {
+        fprintf(stderr, "[Gamescope WSI] minImageCount overridden by vk_x11_override_min_image_count: %u\n", *minCount);
+        return *minCount;
+      }
+
+      return 3u;
+    }();
+
+    return s_minImageCount;
+  }
+
+  static bool getEnsureMinImageCount() {
+    static bool s_ensureMinImageCount = []() -> bool {
+      if (auto ensure = parseEnv<bool>("GAMESCOPE_WSI_ENSURE_MIN_IMAGE_COUNT")) {
+        return *ensure;
+      }
+      if (auto ensure = parseEnv<bool>("vk_x11_ensure_min_image_count")) {
+        return *ensure;
+      }
+      return false;
+    }();
+    return s_ensureMinImageCount;
+  }
+
+  // Taken from Mesa, licensed under MIT.
+  //
+  // No real reason to rewrite this code,
+  // it works :)
+  static char *
+  __getProgramName()
+  {
+    char * arg = strrchr(program_invocation_name, '/');
+    if (arg) {
+        char *program_name = NULL;
+        /* If the / character was found this is likely a linux path or
+        * an invocation path for a 64-bit wine program.
+        *
+        * However, some programs pass command line arguments into argv[0].
+        * Strip these arguments out by using the realpath only if it was
+        * a prefix of the invocation name.
+        */
+        char *path = realpath("/proc/self/exe", NULL);
+
+        if (path && strncmp(path, program_invocation_name, strlen(path)) == 0) {
+          /* This shouldn't be null because path is a a prefix,
+            * but check it anyway since path is static. */
+          char * name = strrchr(path, '/');
+          if (name)
+              program_name = strdup(name + 1);
+        }
+        if (path) {
+          free(path);
+        }
+        if (!program_name) {
+          program_name = strdup(arg+1);
+        }
+        return program_name;
+    }
+
+    /* If there was no '/' at all we likely have a windows like path from
+      * a wine application.
+      */
+    arg = strrchr(program_invocation_name, '\\');
+    if (arg)
+        return strdup(arg+1);
+
+    return strdup(program_invocation_name);
+  }
+
+  std::string_view getExecutableName() {
+    static std::string s_execName = []() -> std::string
+    {
+      const char *mesaExecutableEnv = getenv("MESA_DRICONF_EXECUTABLE_OVERRIDE");
+      if (mesaExecutableEnv && *mesaExecutableEnv) {
+        fprintf(stderr, "[Gamescope WSI] Executable name overriden by MESA_DRICONF_EXECUTABLE_OVERRIDE: %s\n", mesaExecutableEnv);
+        return mesaExecutableEnv;
+      }
+
+      const char *mesaProcessName = getenv("MESA_PROCESS_NAME");
+      if (mesaProcessName && *mesaProcessName) {
+        fprintf(stderr, "[Gamescope WSI] Executable name overriden by MESA_PROCESS_NAME: %s\n", mesaExecutableEnv);
+        return mesaProcessName;
+      }
+
+      std::string name;
+      {
+        char *programNameCStr = __getProgramName();
+        name = programNameCStr;
+        free(programNameCStr);
+      }
+
+      fprintf(stderr, "[Gamescope WSI] Executable name: %s\n", name.c_str());
+      return name;
+    }();
+
+    return s_execName;
+  }
+
   static GamescopeLayerClient::Flags defaultLayerClientFlags(const VkApplicationInfo *pApplicationInfo, uint32_t appid) {
     GamescopeLayerClient::Flags flags = 0;
 
@@ -112,6 +279,40 @@ namespace GamescopeWSILayer {
       if ((pApplicationInfo->pEngineName == "vkd3d"sv && pApplicationInfo->engineVersion >= VK_MAKE_VERSION(2, 12, 0)) ||
           (pApplicationInfo->pEngineName == "DXVK"sv  && pApplicationInfo->engineVersion >= VK_MAKE_VERSION(2, 3,  0))) {
         flags |= GamescopeLayerClient::Flag::FrameLimiterAware;
+      }
+    }
+
+    std::string_view executable = getExecutableName();
+
+    // Work around various Croteam games not handling
+    // suboptimal and swapchain extent correctly.
+    if (executable == "Talos"sv ||
+        executable == "Talos_Unrestricted"sv ||
+        executable == "Talos_VR"sv ||
+        executable == "Talos_Unrestricted_VR"sv ||
+        executable == "Sam2017"sv ||
+        executable == "Sam2017_Unrestricted"sv) {
+      flags |= GamescopeLayerClient::Flag::ForceSwapchainExtent;
+      flags |= GamescopeLayerClient::Flag::NoSuboptimal;
+    }
+
+    {
+      const char *forceSwapchainExtentEnvVar = getenv("vk_wsi_force_swapchain_to_current_extent");
+      if (forceSwapchainExtentEnvVar && *forceSwapchainExtentEnvVar) {
+        if (forceSwapchainExtentEnvVar == "true"sv)
+          flags |= GamescopeLayerClient::Flag::ForceSwapchainExtent;
+        else
+          flags &= ~GamescopeLayerClient::Flag::ForceSwapchainExtent;
+      }
+    }
+
+    {
+      const char *ignoreSuboptimalEnvVar = getenv("vk_x11_ignore_suboptimal");
+      if (ignoreSuboptimalEnvVar && *ignoreSuboptimalEnvVar) {
+        if (ignoreSuboptimalEnvVar == "true"sv)
+          flags |= GamescopeLayerClient::Flag::NoSuboptimal;
+        else
+          flags &= ~GamescopeLayerClient::Flag::NoSuboptimal;
       }
     }
 
@@ -193,6 +394,7 @@ namespace GamescopeWSILayer {
   struct GamescopeInstanceData {
     wl_display* display;
     uint32_t appId = 0;
+    std::string engineName;
     GamescopeLayerClient::Flags flags = 0;
   };
   VKROOTS_DEFINE_SYNCHRONIZED_MAP_TYPE(GamescopeInstance, VkInstance);
@@ -209,7 +411,11 @@ namespace GamescopeWSILayer {
     GamescopeLayerClient::Flags flags;
     bool hdrOutput;
 
+    // Cached for comparison.
+    std::optional<VkRect2D> cachedWindowRect;
+
     bool isWayland() const {
+      // Is native Wayland?
       return connection == nullptr;
     }
 
@@ -222,7 +428,7 @@ namespace GamescopeWSILayer {
       return hdrOutput && hdrAllowed;
     }
 
-    bool canBypassXWayland() const {
+    bool canBypassXWayland() {
       if (isWayland())
         return true;
 
@@ -233,6 +439,8 @@ namespace GamescopeWSILayer {
         fprintf(stderr, "[Gamescope WSI] canBypassXWayland: failed to get window info for window 0x%x.\n", window);
         return false;
       }
+
+      cachedWindowRect = *rect;
 
       auto toplevelRect = xcb::getWindowRect(connection, *toplevelWindow);
       if (!toplevelRect) {
@@ -294,6 +502,7 @@ namespace GamescopeWSILayer {
     bool isBypassingXWayland;
     bool forceFifo;
     VkPresentModeKHR presentMode;
+    VkExtent2D extent;
     uint32_t serverId = 0;
     bool retired = false;
 
@@ -379,6 +588,7 @@ namespace GamescopeWSILayer {
       createInfo.enabledExtensionCount   = uint32_t(enabledExts.size());
       createInfo.ppEnabledExtensionNames = enabledExts.data();
 
+      setenv("vk_xwayland_wait_ready", "false", 0);
       setenv("vk_khr_present_wait", "true", 0);
 
       VkResult result = pfnCreateInstanceProc(&createInfo, pAllocator, pInstance);
@@ -390,13 +600,31 @@ namespace GamescopeWSILayer {
         fprintf(stderr, "[Gamescope WSI] Failed to connect to gamescope socket: %s. Bypass layer will be unavailable.\n", gamescopeWaylandSocket());
         return result;
       }
+
+      {
+        if (pCreateInfo->pApplicationInfo) {
+          fprintf(stderr, "[Gamescope WSI] Application info:\n");
+          fprintf(stderr, "  pApplicationName: %s\n", pCreateInfo->pApplicationInfo->pApplicationName);
+          fprintf(stderr, "  applicationVersion: %u\n", pCreateInfo->pApplicationInfo->applicationVersion);
+          fprintf(stderr, "  pEngineName: %s\n", pCreateInfo->pApplicationInfo->pEngineName);
+          fprintf(stderr, "  engineVersion: %u\n", pCreateInfo->pApplicationInfo->engineVersion);
+          fprintf(stderr, "  apiVersion: %u\n", pCreateInfo->pApplicationInfo->apiVersion);
+        } else {
+          fprintf(stderr, "[Gamescope WSI] No application info given.\n");
+        }
+      }
       
       {
         uint32_t appId = clientAppId();
 
+        std::string engineName;
+        if (pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pEngineName)
+          engineName = pCreateInfo->pApplicationInfo->pEngineName;
+
         auto state = GamescopeInstance::create(*pInstance, GamescopeInstanceData {
           .display = display,
           .appId   = appId,
+          .engineName = engineName,
           .flags   = defaultLayerClientFlags(pCreateInfo->pApplicationInfo, appId),
         });
 
@@ -405,6 +633,10 @@ namespace GamescopeWSILayer {
         if (state->flags & GamescopeLayerClient::Flag::DisableHDR)
           setenv("DXVK_HDR", "0", 1);
       }
+
+      // Work around the Mesa implementation of this being broken.
+      // ( https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/31134 )
+      setenv("vk_wsi_force_swapchain_to_current_extent", "false", 0);
 
       return result;
     }
@@ -837,73 +1069,6 @@ namespace GamescopeWSILayer {
       return pDispatch->GetPhysicalDeviceWaylandPresentationSupportKHR(physicalDevice, queueFamilyIndex, gamescopeInstance->display);
     }
 
-    static const char* gamescopeWaylandSocket() {
-      return std::getenv("GAMESCOPE_WAYLAND_DISPLAY");
-    }
-
-    static bool isAppInfoGamescope(const VkApplicationInfo *appInfo) {
-      if (!appInfo || !appInfo->pApplicationName)
-        return false;
-
-      return appInfo->pApplicationName == "gamescope"sv;
-    }
-
-    static bool isRunningUnderGamescope() {
-      static bool s_isRunningUnderGamescope = []() -> bool {
-        const char *gamescopeSocketName = gamescopeWaylandSocket();
-        if (!gamescopeSocketName || !*gamescopeSocketName)
-          return false;
-
-        // Gamescope always sets or unsets WAYLAND_SOCKET.
-        // So if that is set to something else, we know we cannot be running
-        // under Gamescope and must be in a nested Wayland session inside of gamescope.
-        const char *waylandSocketName = std::getenv("WAYLAND_DISPLAY");
-        if (waylandSocketName && *waylandSocketName && strcmp(gamescopeSocketName, waylandSocketName) != 0)
-          return false;
-
-        return true;
-      }();
-
-      return s_isRunningUnderGamescope;
-    }
-
-    template <typename T>
-    static std::optional<T> parseEnv(const char *envName) {
-      const char *str = std::getenv(envName);
-      if (!str || !*str)
-        return std::nullopt;
-
-      T value;
-      auto result = std::from_chars(str, str + strlen(str), value);
-      if (result.ec != std::errc{})
-        return std::nullopt;
-
-      return value;
-    }
-
-    static uint32_t getMinImageCount() {
-      static uint32_t s_minImageCount = []() -> uint32_t {
-        if (auto minCount = parseEnv<uint32_t>("GAMESCOPE_WSI_MIN_IMAGE_COUNT")) {
-          fprintf(stderr, "[Gamescope WSI] minImageCount overridden by GAMESCOPE_WSI_MIN_IMAGE_COUNT: %u\n", *minCount);
-          return *minCount;
-        }
-
-        if (auto minCount = parseEnv<uint32_t>("vk_wsi_override_min_image_count")) {
-          fprintf(stderr, "[Gamescope WSI] minImageCount overridden by vk_wsi_override_min_image_count: %u\n", *minCount);
-          return *minCount;
-        }
-
-        if (auto minCount = parseEnv<uint32_t>("vk_x11_override_min_image_count")) {
-          fprintf(stderr, "[Gamescope WSI] minImageCount overridden by vk_x11_override_min_image_count: %u\n", *minCount);
-          return *minCount;
-        }
-
-        return 3u;
-      }();
-
-      return s_minImageCount;
-    }
-
   };
 
   class VkDeviceOverrides {
@@ -917,7 +1082,9 @@ namespace GamescopeWSILayer {
         gamescope_swapchain_destroy(state->object);
       }
       GamescopeSwapchain::remove(swapchain);
+      fprintf(stderr, "[Gamescope WSI] Destroying swapchain: %p\n", reinterpret_cast<void*>(swapchain));
       pDispatch->DestroySwapchainKHR(device, swapchain, pAllocator);
+      fprintf(stderr, "[Gamescope WSI] Destroyed swapchain: %p\n", reinterpret_cast<void*>(swapchain));
     }
 
     static VkResult CreateSwapchainKHR(
@@ -944,15 +1111,30 @@ namespace GamescopeWSILayer {
         return pDispatch->CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
       }
 
-      if (pCreateInfo->oldSwapchain) {
-        if (auto gamescopeSwapchain = GamescopeSwapchain::get(pCreateInfo->oldSwapchain)) {
-          gamescopeSwapchain->retired = true;
-        }
-      }
+      const bool canBypass = gamescopeSurface->canBypassXWayland();
 
       VkSwapchainCreateInfoKHR swapchainInfo = *pCreateInfo;
 
-      const bool canBypass = gamescopeSurface->canBypassXWayland();
+      if (pCreateInfo->oldSwapchain) {
+        if (auto gamescopeSwapchain = GamescopeSwapchain::get(pCreateInfo->oldSwapchain)) {
+          gamescopeSwapchain->retired = true;
+          // If we are going to/from being able to bypass XWayland, make sure
+          // we NULL out oldSwapchain, as they'll be for different surfaces and swapchain types.
+          if (gamescopeSwapchain->isBypassingXWayland != canBypass)
+            swapchainInfo.oldSwapchain = VK_NULL_HANDLE;
+        }
+      }
+
+      if (gamescopeSurface->flags & GamescopeLayerClient::Flag::ForceSwapchainExtent) {
+        if (!gamescopeSurface->isWayland()) {
+          auto rect = xcb::getWindowRect(gamescopeSurface->connection, gamescopeSurface->window);
+          if (!rect)
+            return VK_ERROR_SURFACE_LOST_KHR;
+
+          swapchainInfo.imageExtent = rect->extent;
+        }
+      }
+
       // If we can't flip, fallback to the regular XCB surface on the XCB window.
       if (!canBypass)
         swapchainInfo.surface = gamescopeSurface->fallbackSurface;
@@ -977,9 +1159,16 @@ namespace GamescopeWSILayer {
       // We always send MAILBOX to the driver.
       swapchainInfo.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
 
-      fprintf(stderr, "[Gamescope WSI] Creating swapchain for xid: 0x%0x - minImageCount: %u - format: %s - colorspace: %s - flip: %s\n",
+      uint32_t minImageCount = swapchainInfo.minImageCount;
+      if (getEnsureMinImageCount())
+        minImageCount = std::max(getMinImageCount(), minImageCount);
+      swapchainInfo.minImageCount = minImageCount;
+
+      fprintf(stderr, "[Gamescope WSI] Creating swapchain for xid: 0x%0x - oldSwapchain: %p - provided minImageCount: %u - minImageCount: %u - format: %s - colorspace: %s - flip: %s\n",
         gamescopeSurface->window,
+        reinterpret_cast<void*>(pCreateInfo->oldSwapchain),
         pCreateInfo->minImageCount,
+        minImageCount,
         vkroots::helpers::enumString(pCreateInfo->imageFormat),
         vkroots::helpers::enumString(pCreateInfo->imageColorSpace),
         canBypass ? "true" : "false");
@@ -1045,6 +1234,7 @@ namespace GamescopeWSILayer {
           .isBypassingXWayland = canBypass,
           .forceFifo           = gamescopeIsForcingFifo(), // Were we forcing fifo when this swapchain was made?
           .presentMode         = pCreateInfo->presentMode, // The new present mode.
+          .extent              = pCreateInfo->imageExtent,
           .serverId            = serverId,
         });
         gamescopeSwapchain->pastPresentTimings.reserve(MaxPastPresentationTimes);
@@ -1055,8 +1245,9 @@ namespace GamescopeWSILayer {
       uint32_t imageCount = 0;
       pDispatch->GetSwapchainImagesKHR(device, *pSwapchain, &imageCount, nullptr);
 
-      fprintf(stderr, "[Gamescope WSI] Created swapchain for xid: 0x%0x - imageCount: %u\n",
+      fprintf(stderr, "[Gamescope WSI] Created swapchain for xid: 0x%0x swapchain: %p - imageCount: %u\n",
         gamescopeSurface->window,
+        reinterpret_cast<void*>(*pSwapchain),
         imageCount);
 
       gamescope_swapchain_swapchain_feedback(
@@ -1066,7 +1257,8 @@ namespace GamescopeWSILayer {
         uint32_t(pCreateInfo->imageColorSpace),
         uint32_t(pCreateInfo->compositeAlpha),
         uint32_t(pCreateInfo->preTransform),
-        uint32_t(pCreateInfo->clipped));
+        uint32_t(pCreateInfo->clipped),
+        gamescopeInstance->engineName.c_str());
 
       return VK_SUCCESS;
     }
@@ -1236,8 +1428,27 @@ namespace GamescopeWSILayer {
 
           auto prefetcher = xcb::Prefetcher::GetPrefetcherIf(!gamescopeSurface->isWayland(), gamescopeSurface->connection, gamescopeSurface->window);
           const bool canBypass = gamescopeSurface->canBypassXWayland();
-          if (canBypass != gamescopeSwapchain->isBypassingXWayland)
-            UpdateSwapchainResult(canBypass ? VK_SUBOPTIMAL_KHR : VK_ERROR_OUT_OF_DATE_KHR);
+          if (canBypass != gamescopeSwapchain->isBypassingXWayland) {
+            if (canBypass) {
+              if (!(gamescopeSurface->flags & GamescopeLayerClient::Flag::NoSuboptimal))
+                UpdateSwapchainResult(VK_SUBOPTIMAL_KHR);
+            } else {
+              UpdateSwapchainResult(VK_ERROR_OUT_OF_DATE_KHR);  
+            }
+          }
+
+          // Emulate behaviour when currentExtent changes in X11 swapchain.
+          if (!gamescopeSurface->isWayland() && !(gamescopeSurface->flags & GamescopeLayerClient::Flag::ForceSwapchainExtent)) {
+            // gamescopeSurface->cachedWindowSize is set by canBypassXWayland.
+            // TODO: Rename that to be some update cached vars thing, then read back canBypassXWayland.            
+            if (gamescopeSurface->cachedWindowRect) {
+              const bool windowSizeChanged = gamescopeSurface->cachedWindowRect->extent != gamescopeSwapchain->extent;
+              if (windowSizeChanged)
+                UpdateSwapchainResult(VK_ERROR_OUT_OF_DATE_KHR);
+            } else {
+              fprintf(stderr, "[Gamescope WSI] QueuePresentKHR: Failed to get cached window size for swapchain %u\n", i);
+            }
+          }
         }
       }
 

@@ -99,23 +99,24 @@ namespace gamescope
 
 		const int nRefreshRate = GetRefresh();
 		const uint64_t ulRefreshInterval = mHzToRefreshCycle( nRefreshRate );
-		// The redzone is relative to 60Hz for external displays.
-		// Scale it by our target refresh so we don't miss submitting for
-		// vblank in DRM.
-		// (This fixes wonky frame-pacing on 4K@30Hz screens)
-		//
-		// TODO(Josh): Is this fudging still needed with our SteamOS kernel patches
-		// to not account for vertical front porch when dealing with the vblank
-		// drm_commit is going to target?
-		// Need to re-test that.
-		const uint64_t ulRedZone = eScreenType == GAMESCOPE_SCREEN_TYPE_INTERNAL
-			? m_ulVBlankDrawBufferRedZone
-			: std::min<uint64_t>( m_ulVBlankDrawBufferRedZone, ( m_ulVBlankDrawBufferRedZone * 60'000 * nRefreshRate ) / 60'000 );
 
-		bool bVRR = GetBackend()->IsVRRActive();
+		bool bVRR = GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->IsVRRActive();
 		uint64_t ulOffset = 0;
 		if ( !bVRR )
 		{
+			// The redzone is relative to 60Hz for external displays.
+			// Scale it by our target refresh so we don't miss submitting for
+			// vblank in DRM.
+			// (This fixes wonky frame-pacing on 4K@30Hz screens)
+			//
+			// TODO(Josh): Is this fudging still needed with our SteamOS kernel patches
+			// to not account for vertical front porch when dealing with the vblank
+			// drm_commit is going to target?
+			// Need to re-test that.
+			const uint64_t ulRedZone = eScreenType == GAMESCOPE_SCREEN_TYPE_INTERNAL
+				? m_ulVBlankDrawBufferRedZone
+				: std::min<uint64_t>( m_ulVBlankDrawBufferRedZone, ( m_ulVBlankDrawBufferRedZone * 60'000 * nRefreshRate ) / 60'000 );
+
 			const uint64_t ulDecayAlpha = m_ulVBlankRateOfDecayPercentage; // eg. 980 = 98%
 
 			uint64_t ulDrawTime = m_ulLastDrawTime;
@@ -162,8 +163,9 @@ namespace gamescope
 				m_ulRollingMaxDrawTime = kStartingVBlankDrawTime;
 			}
 
-			// TODO(Josh): We can probably do better than this for VRR.
-			uint64_t ulDrawTime = kVRRFlushingDrawTime;
+			uint64_t ulRedZone = kVRRFlushingTime;
+
+			uint64_t ulDrawTime = 0;
 			/// See comment of m_ulVBlankDrawTimeMinCompositing.
 			if ( m_bCurrentlyCompositing )
 				ulDrawTime = std::max( ulDrawTime, m_ulVBlankDrawTimeMinCompositing );
@@ -356,7 +358,22 @@ namespace gamescope
 			if ( !m_bRunning )
 				return;
 
-			VBlankScheduleTime schedule = GetBackend()->FrameSync();
+			VBlankScheduleTime schedule;
+			if ( GetBackend()->GetCurrentConnector() )
+			{
+				schedule = GetBackend()->GetCurrentConnector()->FrameSync();
+			}
+			else
+			{
+				// If we don't currently have a connector, make up some dummy refresh cycle.
+				sleep_for_nanos( mHzToRefreshCycle( g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh ) );
+        		uint64_t ulNow = get_time_in_nanos();
+				schedule = VBlankScheduleTime
+				{
+					.ulTargetVBlank  = ulNow + 3'000'000,
+					.ulScheduledWakeupPoint = ulNow,
+				};
+			}
 
 			const uint64_t ulWakeupTime = get_time_in_nanos();
 			{

@@ -38,6 +38,7 @@ add_project_arguments(cppc.get_supported_arguments([
 ]), language: 'cpp')
 
 add_project_arguments(cppc.get_supported_arguments([
+  '-fno-exceptions',
   '-ffast-math',
 ]), language: 'cpp')
 
@@ -50,7 +51,7 @@ dep_wayland = dependency('wayland-client')
 vulkan_dep = dependency('vulkan')
 
 if get_option('enable_openvr_support')
-  openvr_dep = dependency('openvr', version: '>= 2', required : false)
+  openvr_dep = dependency('openvr', version: '>= 2.7', required : false)
   if not openvr_dep.found()
     cmake = import('cmake')
     openvr_var = cmake.subproject_options()
@@ -67,6 +68,7 @@ endif
 add_project_arguments(
   '-DHAVE_PIPEWIRE=@0@'.format(pipewire_dep.found().to_int()),
   '-DHAVE_OPENVR=@0@'.format(openvr_dep.found().to_int()),
+  '-DSCRIPT_DIR="@0@"'.format(prefix / data_dir / 'gamescope/scripts'),
   language: 'cpp',
 )
 
@@ -94,3 +96,6 @@ endif
 if get_option('enable_gamescope')
   subdir('src')
 endif
+
+# Handle default script/config stuff
+meson.add_install_script('default_scripts_install.sh')

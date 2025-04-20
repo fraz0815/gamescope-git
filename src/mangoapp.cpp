@@ -4,10 +4,13 @@
 #include <cstring>
 
 #include "steamcompmgr.hpp"
+#include "refresh_rate.h"
 #include "main.hpp"
 
 static bool inited = false;
 static int msgid = 0;
+extern bool g_bAppWantsHDRCached;
+extern uint32_t g_focusedBaseAppId;
 
 struct mangoapp_msg_header {
     long msg_type;  // Message queue ID, never change
@@ -25,6 +28,11 @@ struct mangoapp_msg_v1 {
     uint64_t latency_ns;
     uint32_t outputWidth;
     uint32_t outputHeight;
+    uint16_t displayRefresh;
+    bool bAppWantsHDR : 1;
+    bool bSteamFocused : 1;
+    char engineName[40];
+    
     // WARNING: Always ADD fields, never remove or repurpose fields
 } __attribute__((packed)) mangoapp_msg_v1;
 
@@ -50,6 +58,14 @@ void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uin
     mangoapp_msg_v1.pid = focusWindow_pid;
     mangoapp_msg_v1.outputWidth = g_nOutputWidth;
     mangoapp_msg_v1.outputHeight = g_nOutputHeight;
+    mangoapp_msg_v1.displayRefresh = (uint16_t) gamescope::ConvertmHzToHz( g_nOutputRefresh );
+    mangoapp_msg_v1.bAppWantsHDR = g_bAppWantsHDRCached;
+    mangoapp_msg_v1.bSteamFocused = g_focusedBaseAppId == 769;
+    memset(mangoapp_msg_v1.engineName, 0, sizeof(mangoapp_msg_v1.engineName));
+    if (focusWindow_engine)
+        focusWindow_engine->copy(mangoapp_msg_v1.engineName, sizeof(mangoapp_msg_v1.engineName) / sizeof(char));
+    else
+        std::string("gamescope").copy(mangoapp_msg_v1.engineName, sizeof(mangoapp_msg_v1.engineName) / sizeof(char));
     msgsnd(msgid, &mangoapp_msg_v1, sizeof(mangoapp_msg_v1) - sizeof(mangoapp_msg_v1.hdr.msg_type), IPC_NOWAIT);
 }
 

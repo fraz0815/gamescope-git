@@ -8,7 +8,7 @@ extern int g_nPreferredOutputHeight;
 
 namespace gamescope
 {
-    class CHeadlessConnector final : public IBackendConnector
+    class CHeadlessConnector final : public CBaseBackendConnector
     {
     public:
         CHeadlessConnector()
@@ -38,6 +38,10 @@ namespace gamescope
         {
             return m_HDRInfo;
         }
+		virtual bool IsVRRActive() const override
+		{
+			return false;
+		}
         virtual std::span<const BackendMode> GetModes() const override
         {
             return std::span<const BackendMode>{};
@@ -80,6 +84,11 @@ namespace gamescope
         {
             return "Virtual Display";
         }
+
+		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override
+		{
+            return 0;
+		}
 
     private:
         BackendConnectorHDRInfo m_HDRInfo{};
@@ -147,19 +156,14 @@ namespace gamescope
 		{
 			return VK_IMAGE_LAYOUT_GENERAL;
 		}
-		virtual void GetPreferredOutputFormat( VkFormat *pPrimaryPlaneFormat, VkFormat *pOverlayPlaneFormat ) const override
+		virtual void GetPreferredOutputFormat( uint32_t *pPrimaryPlaneFormat, uint32_t *pOverlayPlaneFormat ) const override
 		{
-			*pPrimaryPlaneFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-			*pOverlayPlaneFormat = VK_FORMAT_B8G8R8A8_UNORM;
+			*pPrimaryPlaneFormat = VulkanFormatToDRM( VK_FORMAT_A2B10G10R10_UNORM_PACK32 );
+			*pOverlayPlaneFormat = VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM );
 		}
 		virtual bool ValidPhysicalDevice( VkPhysicalDevice pVkPhysicalDevice ) const override
 		{
 			return true;
-		}
-
-		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override
-		{
-            return 0;
 		}
 
 		virtual void DirtyState( bool bForce, bool bForceModeset ) override
@@ -178,7 +182,7 @@ namespace gamescope
 
 		virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_buffer *pBuffer, wlr_dmabuf_attributes *pDmaBuf ) override
 		{
-			return nullptr;
+			return new CBaseBackendFb();
 		}
 
 		virtual bool UsesModifiers() const override
@@ -200,11 +204,6 @@ namespace gamescope
 				return &m_Connector;
 
 			return nullptr;
-		}
-
-		virtual bool IsVRRActive() const override
-		{
-			return false;
 		}
 
 		virtual bool SupportsPlaneHardwareCursor() const override

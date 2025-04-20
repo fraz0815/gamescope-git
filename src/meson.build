@@ -33,7 +33,7 @@ wlroots_dep = dependency(
 
 displayinfo_dep = dependency(
   'libdisplay-info',
-  version: ['>= 0.0.0', '< 0.2.0'],
+  version: ['>= 0.0.0', '< 0.3.0'],
   fallback: ['libdisplay-info', 'di_dep'],
   default_options: ['default_library=static'],
 )
@@ -90,32 +90,44 @@ reshade_include = include_directories([
   '../thirdparty/SPIRV-Headers/include/spirv/unified1'
 ])
 
+sol2_include = include_directories(['../thirdparty'])
+
 required_wlroots_features = ['xwayland']
 
 src = [
+  'Backends/HeadlessBackend.cpp',
+  'Backends/WaylandBackend.cpp',
+  'Utils/TempFiles.cpp',
+  'Utils/Version.cpp',
+  'Utils/Process.cpp',
+  'Script/Script.cpp',
+  'BufferMemo.cpp',
   'steamcompmgr.cpp',
   'convar.cpp',
   'commit.cpp',
   'color_helpers.cpp',
   'main.cpp',
   'edid.cpp',
-  'headless.cpp',
   'wlserver.cpp',
   'vblankmanager.cpp',
   'rendervulkan.cpp',
   'log.cpp',
   'ime.cpp',
   'mangoapp.cpp',
+  'Timeline.cpp',
   'reshade_effect_manager.cpp',
   'backend.cpp',
   'x11cursor.cpp',
-  'wayland_backend.cpp',
   'InputEmulation.cpp',
+  'LibInputHandler.cpp',
 ]
+
+luajit_dep = dependency( 'luajit' )
+libinput_dep = dependency('libinput', required: true)
 
 gamescope_cpp_args = []
 if drm_dep.found()
-  src += 'drm.cpp'
+  src += 'Backends/DRMBackend.cpp'
   src += 'modegen.cpp'
   required_wlroots_features += 'libinput_backend'
   liftoff_dep = dependency(
@@ -129,7 +141,7 @@ else
 endif
 
 if sdl2_dep.found()
-  src += 'sdlwindow.cpp'
+  src += 'Backends/SDLBackend.cpp'
 endif
 
 gamescope_cpp_args += '-DHAVE_DRM=@0@'.format(drm_dep.found().to_int())
@@ -137,6 +149,7 @@ gamescope_cpp_args += '-DHAVE_SDL2=@0@'.format(sdl2_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_AVIF=@0@'.format(avif_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBCAP=@0@'.format(cap_dep.found().to_int())
 gamescope_cpp_args += '-DHAVE_LIBEIS=@0@'.format(eis_dep.found().to_int())
+gamescope_cpp_args += '-DHAVE_SCRIPTING=1'
 
 src += spirv_shaders
 src += protocols_server_src
@@ -147,7 +160,7 @@ if pipewire_dep.found()
 endif
 
 if openvr_dep.found()
-  src += 'vr_session.cpp'
+  src += 'Backends/OpenVRBackend.cpp'
 endif
 
 foreach feat : required_wlroots_features
@@ -156,29 +169,55 @@ foreach feat : required_wlroots_features
   endif
 endforeach
 
+cc = meson.get_compiler('c')
+compiler_name = cc.get_id()
+compiler_version = cc.version()
+
+vcs_tag_cmd = ['git', 'describe', '--always', '--tags', '--dirty=+']
+vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+version_tag = vcs_tag + ' (' + compiler_name + ' ' + compiler_version + ')'
+
+gamescope_version_conf = configuration_data()
+gamescope_version_conf.set('VCS_TAG', version_tag)
+
+gamescope_version = configure_file(
+  input : 'GamescopeVersion.h.in',
+  output : 'GamescopeVersion.h',
+  configuration : gamescope_version_conf
+)
+
   executable(
     'gamescope',
-    src, reshade_src,
-    include_directories : [reshade_include],
+    src, reshade_src, gamescope_version,
+    include_directories : [reshade_include, sol2_include],
     dependencies: [
       dep_wayland, dep_x11, dep_xdamage, dep_xcomposite, dep_xrender, dep_xext, dep_xfixes,
       dep_xxf86vm, dep_xres, glm_dep, drm_dep, wayland_server,
       xkbcommon, thread_dep, sdl2_dep, wlroots_dep,
       vulkan_dep, liftoff_dep, dep_xtst, dep_xmu, cap_dep, epoll_dep, pipewire_dep, librt_dep,
       stb_dep, displayinfo_dep, openvr_dep, dep_xcursor, avif_dep, dep_xi,
-      libdecor_dep, eis_dep,
+      libdecor_dep, eis_dep, luajit_dep, libinput_dep,
     ],
     install: true,
     cpp_args: gamescope_cpp_args,
   )
 
+gamescope_core_src = [
+  'convar.cpp',
+  'log.cpp',
+  'Utils/Process.cpp',
+  'Utils/Version.cpp',
+]
+
 if pipewire_dep.found()
-  executable( 'gamescopestream', 'gamescopestream.cpp', protocols_client_src, dependencies: [ pipewire_dep, dep_wayland, libdecor_dep ], install: true )
+  executable( 'gamescopestream', ['Apps/gamescopestream.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [ pipewire_dep, dep_wayland, libdecor_dep ], install: true )
 endif
 
+executable('gamescopereaper', ['Apps/gamescopereaper.cpp', gamescope_core_src], gamescope_version, install:true )
+
 benchmark_dep = dependency('benchmark', required: get_option('benchmark'), disabler: true)
-executable('gamescope_color_microbench', ['color_bench.cpp', 'color_helpers.cpp'], dependencies:[benchmark_dep, glm_dep])
+executable('gamescope_color_microbench', ['color_bench.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[benchmark_dep, glm_dep])
 
-executable('gamescope_color_tests', ['color_tests.cpp', 'color_helpers.cpp'], dependencies:[glm_dep])
+executable('gamescope_color_tests', ['color_tests.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[glm_dep])
 
-executable('gamescopectl', ['gamescopectl.cpp', 'convar.cpp', 'log.cpp'], protocols_client_src, dependencies: [dep_wayland], install:true )
+executable('gamescopectl', ['Apps/gamescopectl.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland], install:true )

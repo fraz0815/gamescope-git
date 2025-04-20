@@ -4,10 +4,12 @@
 #include "vblankmanager.hpp"
 #include "steamcompmgr.hpp"
 #include "edid.h"
-#include "defer.hpp"
+#include "Utils/Defer.h"
+#include "Utils/Algorithm.h"
 #include "convar.h"
 #include "refresh_rate.h"
 #include "waitable.h"
+#include "Utils/TempFiles.h"
 
 #include <cstring>
 #include <unordered_map>
@@ -27,19 +29,23 @@
 #include <single-pixel-buffer-v1-client-protocol.h>
 #include <presentation-time-client-protocol.h>
 #include <frog-color-management-v1-client-protocol.h>
+#include <xx-color-management-v3-client-protocol.h>
 #include <pointer-constraints-unstable-v1-client-protocol.h>
 #include <relative-pointer-unstable-v1-client-protocol.h>
+#include <primary-selection-unstable-v1-client-protocol.h>
 #include <fractional-scale-v1-client-protocol.h>
 #include <xdg-toplevel-icon-v1-client-protocol.h>
 #include "wlr_end.hpp"
 
 #include "drm_include.h"
 
+#define WL_FRACTIONAL_SCALE_DENOMINATOR 120
+
 extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
 extern bool g_bForceHDR10OutputDebug;
 extern bool g_bBorderlessOutputWindow;
-extern bool g_bAllowVRR;
+extern gamescope::ConVar<bool> cv_adaptive_sync;
 
 extern gamescope::ConVar<bool> cv_composite_force;
 extern bool g_bColorSliderInUse;
@@ -50,6 +56,8 @@ using namespace std::literals;
 
 static LogScope xdg_log( "xdg_backend" );
 
+static const char *GAMESCOPE_plane_tag = "gamescope-plane";
+
 template <typename Func, typename... Args>
 auto CallWithAllButLast(Func pFunc, Args&&... args)
 {
@@ -58,6 +66,17 @@ auto CallWithAllButLast(Func pFunc, Args&&... args)
         return pFunc(std::get<idx>(std::forward<Tuple>(tuple))...);
     };
     return Forwarder(std::forward_as_tuple(args...), std::make_index_sequence<sizeof...(Args) - 1>());
+}
+
+static inline uint32_t WaylandScaleToPhysical( uint32_t pValue, uint32_t pFactor ) {
+    return pValue * pFactor / WL_FRACTIONAL_SCALE_DENOMINATOR;
+}
+static inline uint32_t WaylandScaleToLogical( uint32_t pValue, uint32_t pFactor ) {
+    return div_roundup( pValue * WL_FRACTIONAL_SCALE_DENOMINATOR, pFactor );
+}
+
+static bool IsSurfacePlane( wl_surface *pSurface ) {
+    return wl_proxy_get_tag( (wl_proxy *)pSurface ) == &GAMESCOPE_plane_tag;
 }
 
 #define WAYLAND_NULL() []<typename... Args> ( void *pData, Args... args ) { }
@@ -80,57 +99,6 @@ namespace gamescope
     class CWaylandPlane;
     class CWaylandBackend;
     class CWaylandFb;
-
-    class CWaylandConnector final : public IBackendConnector
-    {
-    public:
-        CWaylandConnector( CWaylandBackend *pBackend );
-        bool UpdateEdid();
-
-        virtual ~CWaylandConnector();
-
-        /////////////////////
-        // IBackendConnector
-        /////////////////////
-
-        virtual gamescope::GamescopeScreenType GetScreenType() const override;
-        virtual GamescopePanelOrientation GetCurrentOrientation() const override;
-        virtual bool SupportsHDR() const override;
-        virtual bool IsHDRActive() const override;
-        virtual const BackendConnectorHDRInfo &GetHDRInfo() const override;
-        virtual std::span<const BackendMode> GetModes() const override;
-
-        virtual bool SupportsVRR() const override;
-
-        virtual std::span<const uint8_t> GetRawEDID() const override;
-        virtual std::span<const uint32_t> GetValidDynamicRefreshRates() const override;
-
-        virtual void GetNativeColorimetry(
-            bool bHDR10,
-            displaycolorimetry_t *displayColorimetry, EOTF *displayEOTF,
-            displaycolorimetry_t *outputEncodingColorimetry, EOTF *outputEncodingEOTF ) const override;
-
-        virtual const char *GetName() const override
-        {
-            return "Wayland";
-        }
-        virtual const char *GetMake() const override
-        {
-            return "Gamescope";
-        }
-        virtual const char *GetModel() const override
-        {
-            return "Virtual Display";
-        }
-    private:
-
-        friend CWaylandPlane;
-
-        BackendConnectorHDRInfo m_HDRInfo{};
-        std::vector<uint8_t> m_FakeEdid;
-
-        CWaylandBackend *m_pBackend = nullptr;
-    };
 
     struct WaylandPlaneState
     {
@@ -163,10 +131,36 @@ namespace gamescope
         return outState;
     }
 
+    static int CreateShmBuffer( uint32_t uSize, void *pData )
+    {
+        char szShmBufferPath[ PATH_MAX ];
+        int nFd = MakeTempFile( szShmBufferPath, k_szGamescopeTempShmTemplate );
+        if ( nFd < 0 )
+            return -1;
+
+        if ( ftruncate( nFd, uSize ) < 0 )
+        {
+            close( nFd );
+            return -1;
+        }
+
+        if ( pData )
+        {
+            void *pMappedData = mmap( nullptr, uSize, PROT_READ | PROT_WRITE, MAP_SHARED, nFd, 0 );
+            if ( pMappedData == MAP_FAILED )
+                return -1;
+            defer( munmap( pMappedData, uSize ) );
+
+            memcpy( pMappedData, pData, uSize );
+        }
+
+        return nFd;
+    }
+
     class CWaylandPlane
     {
     public:
-        CWaylandPlane( CWaylandBackend *pBackend );
+        CWaylandPlane( CWaylandConnector *pBackend );
         ~CWaylandPlane();
 
         bool Init( CWaylandPlane *pParent, CWaylandPlane *pSiblingBelow );
@@ -185,7 +179,13 @@ namespace gamescope
 
         std::optional<WaylandPlaneState> GetCurrentState() { std::unique_lock lock( m_PlaneStateLock ); return m_oCurrentPlaneState; }
 
+        void UpdateVRRRefreshRate();
+
     private:
+
+        void Wayland_Surface_Enter( wl_surface *pSurface, wl_output *pOutput );
+        void Wayland_Surface_Leave( wl_surface *pSurface, wl_output *pOutput );
+        static const wl_surface_listener s_SurfaceListener;
 
         void LibDecor_Frame_Configure( libdecor_frame *pFrame, libdecor_configuration *pConfiguration );
         void LibDecor_Frame_Close( libdecor_frame *pFrame );
@@ -214,24 +214,50 @@ namespace gamescope
             uint32_t uMaxFullFrameLuminance );
         static const frog_color_managed_surface_listener s_FrogColorManagedSurfaceListener;
 
+        void Wayland_XXColorManagementSurface_PreferredChanged( xx_color_management_surface_v3 *pColorManagementSurface );
+        static const xx_color_management_surface_v3_listener s_XXColorManagementSurfaceListener;
+        void UpdateXXPreferredColorManagement();
+
+        void Wayland_XXImageDescriptionInfo_Done( xx_image_description_info_v3 *pImageDescInfo );
+        void Wayland_XXImageDescriptionInfo_ICCFile( xx_image_description_info_v3 *pImageDescInfo, int32_t nICCFd, uint32_t uICCSize );
+        void Wayland_XXImageDescriptionInfo_Primaries( xx_image_description_info_v3 *pImageDescInfo, int32_t nRedX, int32_t nRedY, int32_t nGreenX, int32_t nGreenY, int32_t nBlueX, int32_t nBlueY, int32_t nWhiteX, int32_t nWhiteY );
+        void Wayland_XXImageDescriptionInfo_PrimariesNamed( xx_image_description_info_v3 *pImageDescInfo, uint32_t uPrimaries );
+        void Wayland_XXImageDescriptionInfo_TFPower( xx_image_description_info_v3 *pImageDescInfo, uint32_t uExp);
+        void Wayland_XXImageDescriptionInfo_TFNamed( xx_image_description_info_v3 *pImageDescInfo, uint32_t uTF);
+        void Wayland_XXImageDescriptionInfo_Luminances( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMinLum, uint32_t uMaxLum, uint32_t uRefLum );
+        void Wayland_XXImageDescriptionInfo_TargetPrimaries( xx_image_description_info_v3 *pImageDescInfo, int32_t nRedX, int32_t nRedY, int32_t nGreenX, int32_t nGreenY, int32_t nBlueX, int32_t nBlueY, int32_t nWhiteX, int32_t nWhiteY );
+        void Wayland_XXImageDescriptionInfo_TargetLuminance( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMinLum, uint32_t uMaxLum );
+        void Wayland_XXImageDescriptionInfo_Target_MaxCLL( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMaxCLL );
+        void Wayland_XXImageDescriptionInfo_Target_MaxFALL( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMaxFALL );
+
         void Wayland_FractionalScale_PreferredScale( wp_fractional_scale_v1 *pFractionalScale, uint32_t uScale );
         static const wp_fractional_scale_v1_listener s_FractionalScaleListener;
 
+        CWaylandConnector *m_pConnector = nullptr;
         CWaylandBackend *m_pBackend = nullptr;
 
         CWaylandPlane *m_pParent = nullptr;
         wl_surface *m_pSurface = nullptr;
         wp_viewport *m_pViewport = nullptr;
-        libdecor_frame *m_pFrame = nullptr;
-        wl_subsurface *m_pSubsurface = nullptr;
         frog_color_managed_surface *m_pFrogColorManagedSurface = nullptr;
+        xx_color_management_surface_v3 *m_pXXColorManagedSurface = nullptr;
         wp_fractional_scale_v1 *m_pFractionalScale = nullptr;
+        wl_subsurface *m_pSubsurface = nullptr;
+        libdecor_frame *m_pFrame = nullptr;
         libdecor_window_state m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
+        std::vector<wl_output *> m_pOutputs;
         bool m_bNeedsDecorCommit = false;
         uint32_t m_uFractionalScale = 120;
 
         std::mutex m_PlaneStateLock;
         std::optional<WaylandPlaneState> m_oCurrentPlaneState;
+    };
+    const wl_surface_listener CWaylandPlane::s_SurfaceListener =
+    {
+        .enter = WAYLAND_USERDATA_TO_THIS( CWaylandPlane, Wayland_Surface_Enter ),
+        .leave = WAYLAND_USERDATA_TO_THIS( CWaylandPlane, Wayland_Surface_Leave ),
+        .preferred_buffer_scale = WAYLAND_NULL(),
+        .preferred_buffer_transform = WAYLAND_NULL(),
     };
     // Can't be const, libdecor api bad...
     libdecor_frame_interface CWaylandPlane::s_LibDecorFrameInterface =
@@ -250,6 +276,10 @@ namespace gamescope
     const frog_color_managed_surface_listener CWaylandPlane::s_FrogColorManagedSurfaceListener =
     {
         .preferred_metadata = WAYLAND_USERDATA_TO_THIS( CWaylandPlane, Wayland_FrogColorManagedSurface_PreferredMetadata ),
+    };
+    const xx_color_management_surface_v3_listener CWaylandPlane::s_XXColorManagementSurfaceListener =
+    {
+        .preferred_changed = WAYLAND_USERDATA_TO_THIS( CWaylandPlane, Wayland_XXColorManagementSurface_PreferredChanged ),
     };
     const wp_fractional_scale_v1_listener CWaylandPlane::s_FractionalScaleListener =
     {
@@ -295,10 +325,97 @@ namespace gamescope
         int32_t nScale = 1;
     };
 
+
+    class CWaylandConnector final : public CBaseBackendConnector, public INestedHints
+    {
+    public:
+        CWaylandConnector( CWaylandBackend *pBackend, uint64_t ulVirtualConnectorKey );
+        virtual ~CWaylandConnector();
+
+        bool UpdateEdid();
+        bool Init();
+        void SetFullscreen( bool bFullscreen ); // Thread safe, can be called from the input thread.
+        void UpdateFullscreenState();
+
+
+        bool HostCompositorIsCurrentlyVRR() const { return m_bHostCompositorIsCurrentlyVRR; }
+        void SetHostCompositorIsCurrentlyVRR( bool bActive ) { m_bHostCompositorIsCurrentlyVRR = bActive; }
+        bool CurrentDisplaySupportsVRR() const { return HostCompositorIsCurrentlyVRR(); }
+        CWaylandBackend *GetBackend() const { return m_pBackend; }
+
+        /////////////////////
+        // IBackendConnector
+        /////////////////////
+
+        virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override;
+
+        virtual gamescope::GamescopeScreenType GetScreenType() const override;
+        virtual GamescopePanelOrientation GetCurrentOrientation() const override;
+        virtual bool SupportsHDR() const override;
+        virtual bool IsHDRActive() const override;
+        virtual const BackendConnectorHDRInfo &GetHDRInfo() const override;
+        virtual bool IsVRRActive() const override;
+        virtual std::span<const BackendMode> GetModes() const override;
+
+        virtual bool SupportsVRR() const override;
+
+        virtual std::span<const uint8_t> GetRawEDID() const override;
+        virtual std::span<const uint32_t> GetValidDynamicRefreshRates() const override;
+
+        virtual void GetNativeColorimetry(
+            bool bHDR10,
+            displaycolorimetry_t *displayColorimetry, EOTF *displayEOTF,
+            displaycolorimetry_t *outputEncodingColorimetry, EOTF *outputEncodingEOTF ) const override;
+
+        virtual const char *GetName() const override
+        {
+            return "Wayland";
+        }
+        virtual const char *GetMake() const override
+        {
+            return "Gamescope";
+        }
+        virtual const char *GetModel() const override
+        {
+            return "Virtual Display";
+        }
+
+        virtual INestedHints *GetNestedHints() override
+        {
+            return this;
+        }
+
+        ///////////////////
+        // INestedHints
+        ///////////////////
+
+        virtual void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info ) override;
+        virtual void SetRelativeMouseMode( bool bRelative ) override;
+        virtual void SetVisible( bool bVisible ) override;
+        virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
+        virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) override;
+        virtual void SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection ) override;
+    private:
+
+        friend CWaylandPlane;
+
+        BackendConnectorHDRInfo m_HDRInfo{};
+        displaycolorimetry_t m_DisplayColorimetry = displaycolorimetry_709;
+        std::vector<uint8_t> m_FakeEdid;
+
+        CWaylandBackend *m_pBackend = nullptr;
+
+        CWaylandPlane m_Planes[8];
+        bool m_bVisible = true;
+        std::atomic<bool> m_bDesiredFullscreenState = { false };
+
+        bool m_bHostCompositorIsCurrentlyVRR = false;
+    };
+
     class CWaylandFb final : public CBaseBackendFb
     {
     public:
-        CWaylandFb( CWaylandBackend *pBackend, wl_buffer *pHostBuffer, wlr_buffer *pClientBuffer );
+        CWaylandFb( CWaylandBackend *pBackend, wl_buffer *pHostBuffer );
         ~CWaylandFb();
 
         void OnCompositorAcquire();
@@ -451,7 +568,7 @@ namespace gamescope
         .relative_motion = WAYLAND_USERDATA_TO_THIS( CWaylandInputThread, Wayland_RelativePointer_RelativeMotion ),
     };
 
-    class CWaylandBackend : public CBaseBackend, public INestedHints
+    class CWaylandBackend : public CBaseBackend
     {
     public:
         CWaylandBackend();
@@ -465,10 +582,9 @@ namespace gamescope
         virtual std::span<const char *const> GetInstanceExtensions() const override;
         virtual std::span<const char *const> GetDeviceExtensions( VkPhysicalDevice pVkPhysicalDevice ) const override;
         virtual VkImageLayout GetPresentLayout() const override;
-        virtual void GetPreferredOutputFormat( VkFormat *pPrimaryPlaneFormat, VkFormat *pOverlayPlaneFormat ) const override;
+        virtual void GetPreferredOutputFormat( uint32_t *pPrimaryPlaneFormat, uint32_t *pOverlayPlaneFormat ) const override;
         virtual bool ValidPhysicalDevice( VkPhysicalDevice pVkPhysicalDevice ) const override;
 
-        virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override;
         virtual void DirtyState( bool bForce = false, bool bForceModeset = false ) override;
         virtual bool PollState() override;
 
@@ -481,7 +597,6 @@ namespace gamescope
         virtual IBackendConnector *GetCurrentConnector() override;
         virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) override;
 
-        virtual bool IsVRRActive() const override;
         virtual bool SupportsPlaneHardwareCursor() const override;
 
         virtual bool SupportsTearing() const override;
@@ -495,24 +610,17 @@ namespace gamescope
         virtual glm::uvec2 CursorSurfaceSize( glm::uvec2 uvecSize ) const override;
         virtual void HackUpdatePatchedEdid() override;
 
-        virtual INestedHints *GetNestedHints() override;
-
-        ///////////////////
-        // INestedHints
-        ///////////////////
-
-        virtual void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info ) override;
-        virtual void SetRelativeMouseMode( bool bRelative ) override;
-        virtual void SetVisible( bool bVisible ) override;
-        virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override;
-        virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) override;
-        virtual std::shared_ptr<INestedHints::CursorInfo> GetHostCursor() override;
+        virtual bool UsesVirtualConnectors() override;
+        virtual std::shared_ptr<IBackendConnector> CreateVirtualConnector( uint64_t ulVirtualConnectorKey ) override;
     protected:
         virtual void OnBackendBlobDestroyed( BackendBlob *pBlob ) override;
 
         wl_surface *CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info );
 
         bool SupportsColorManagement() const;
+
+        void SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info );
+        void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative );
         void UpdateCursor();
 
         friend CWaylandConnector;
@@ -530,19 +638,24 @@ namespace gamescope
         wp_viewporter *GetViewporter() const { return m_pViewporter; }
         wp_presentation *GetPresentation() const { return m_pPresentation; }
         frog_color_management_factory_v1 *GetFrogColorManagementFactory() const { return m_pFrogColorMgmtFactory; }
+        xx_color_manager_v3 *GetXXColorManager() const { return m_pXXColorManager; }
         wp_fractional_scale_manager_v1 *GetFractionalScaleManager() const { return m_pFractionalScaleManager; }
         xdg_toplevel_icon_manager_v1 *GetToplevelIconManager() const { return m_pToplevelIconManager; }
         libdecor *GetLibDecor() const { return m_pLibDecor; }
 
-        void SetFullscreen( bool bFullscreen ); // Thread safe, can be called from the input thread.
         void UpdateFullscreenState();
 
-        bool SupportsFormat( uint32_t uDRMFormat ) const;
+        WaylandOutputInfo *GetOutputInfo( wl_output *pOutput )
+        {
+            auto iter = m_pOutputs.find( pOutput );
+            if ( iter == m_pOutputs.end() )
+                return nullptr;
 
-        void SetHostCompositorIsCurrentlyVRR( bool bActive ) { m_bHostCompositorIsCurrentlyVRR = bActive; }
+            return &iter->second;
+        }
 
-        bool CurrentDisplaySupportsVRR() const { return m_bHostCompositorIsCurrentlyVRR; }
         wl_region *GetFullRegion() const { return m_pFullRegion; }
+        CWaylandFb *GetBlackFb() const { return m_BlackFb.get(); }
 
     private:
 
@@ -570,10 +683,21 @@ namespace gamescope
         void Wayland_Keyboard_Leave( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface );
         static const wl_keyboard_listener s_KeyboardListener;
 
-        CWaylandInputThread m_InputThread;
+        void Wayland_XXColorManager_SupportedIntent( xx_color_manager_v3 *pXXColorManager, uint32_t uRenderIntent );
+        void Wayland_XXColorManager_SupportedFeature( xx_color_manager_v3 *pXXColorManager, uint32_t uFeature );
+        void Wayland_XXColorManager_SupportedTFNamed( xx_color_manager_v3 *pXXColorManager, uint32_t uTF );
+        void Wayland_XXColorManager_SupportedPrimariesNamed( xx_color_manager_v3 *pXXColorManager, uint32_t uPrimaries );
+        static const xx_color_manager_v3_listener s_XXColorManagerListener;
 
-        CWaylandConnector m_Connector;
-        CWaylandPlane m_Planes[8];
+        void Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd );
+        void Wayland_DataSource_Cancelled( struct wl_data_source *pSource );
+        static const wl_data_source_listener s_DataSourceListener;
+
+        void Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd );
+        void Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource );
+        static const zwp_primary_selection_source_v1_listener s_PrimarySelectionSourceListener;
+
+        CWaylandInputThread m_InputThread;
 
         wl_display *m_pDisplay = nullptr;
         wl_shm *m_pShm = nullptr;
@@ -589,10 +713,32 @@ namespace gamescope
         OwningRc<CVulkanTexture> m_pBlackTexture;
         wp_presentation *m_pPresentation = nullptr;
         frog_color_management_factory_v1 *m_pFrogColorMgmtFactory = nullptr;
+        xx_color_manager_v3 *m_pXXColorManager = nullptr;
         zwp_pointer_constraints_v1 *m_pPointerConstraints = nullptr;
         zwp_relative_pointer_manager_v1 *m_pRelativePointerManager = nullptr;
         wp_fractional_scale_manager_v1 *m_pFractionalScaleManager = nullptr;
         xdg_toplevel_icon_manager_v1 *m_pToplevelIconManager = nullptr;
+
+        // TODO: Restructure and remove the need for this.
+        std::shared_ptr<CWaylandConnector> m_pFocusConnector;
+
+        wl_data_device_manager *m_pDataDeviceManager = nullptr;
+        wl_data_device *m_pDataDevice = nullptr;
+        std::shared_ptr<std::string> m_pClipboard = nullptr;
+
+        zwp_primary_selection_device_manager_v1 *m_pPrimarySelectionDeviceManager = nullptr;
+        zwp_primary_selection_device_v1 *m_pPrimarySelectionDevice = nullptr;
+        std::shared_ptr<std::string> m_pPrimarySelection = nullptr;
+
+        struct 
+        {
+            std::vector<xx_color_manager_v3_primaries> ePrimaries;
+            std::vector<xx_color_manager_v3_transfer_function> eTransferFunctions;
+            std::vector<xx_color_manager_v3_render_intent> eRenderIntents;
+            std::vector<xx_color_manager_v3_feature> eFeatures;
+
+            bool bSupportsGamescopeColorManagement = false; // Has everything we want and need?
+        } m_XXColorManagerFeatures;
 
         std::unordered_map<wl_output *, WaylandOutputInfo> m_pOutputs;
 
@@ -605,23 +751,19 @@ namespace gamescope
         zwp_locked_pointer_v1 *m_pLockedPointer = nullptr;
         zwp_relative_pointer_v1 *m_pRelativePointer = nullptr;
 
+        bool m_bCanUseModifiers = false;
         std::unordered_map<uint32_t, std::vector<uint64_t>> m_FormatModifiers;
-        std::unordered_set<uint32_t> m_ModifierlessFormats;
         std::unordered_map<uint32_t, wl_buffer *> m_ImportedFbs;
 
         uint32_t m_uPointerEnterSerial = 0;
         bool m_bMouseEntered = false;
+        uint32_t m_uKeyboardEnterSerial = 0;
         bool m_bKeyboardEntered = false;
 
         std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
         wl_surface *m_pCursorSurface = nullptr;
         std::shared_ptr<INestedHints::CursorInfo> m_pDefaultCursorInfo;
         wl_surface *m_pDefaultCursorSurface = nullptr;
-
-        bool m_bVisible = true;
-        std::atomic<bool> m_bDesiredFullscreenState = { false };
-
-        bool m_bHostCompositorIsCurrentlyVRR = false;
     };
     const wl_registry_listener CWaylandBackend::s_RegistryListener =
     {
@@ -664,13 +806,30 @@ namespace gamescope
         .modifiers     = WAYLAND_NULL(),
         .repeat_info   = WAYLAND_NULL(),
     };
+    const xx_color_manager_v3_listener CWaylandBackend::s_XXColorManagerListener
+    {
+        .supported_intent          = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_XXColorManager_SupportedIntent ),
+        .supported_feature         = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_XXColorManager_SupportedFeature ),
+        .supported_tf_named        = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_XXColorManager_SupportedTFNamed ),
+        .supported_primaries_named = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_XXColorManager_SupportedPrimariesNamed ),
+    };
+    const wl_data_source_listener CWaylandBackend::s_DataSourceListener =
+    {
+        .send      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataSource_Send ),
+        .cancelled = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_DataSource_Cancelled ),
+    };
+    const zwp_primary_selection_source_v1_listener CWaylandBackend::s_PrimarySelectionSourceListener =
+    {
+        .send      = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionSource_Send ),
+        .cancelled = WAYLAND_USERDATA_TO_THIS( CWaylandBackend, Wayland_PrimarySelectionSource_Cancelled ),
+    };
 
     //////////////////
     // CWaylandFb
     //////////////////
 
-    CWaylandFb::CWaylandFb( CWaylandBackend *pBackend, wl_buffer *pHostBuffer, wlr_buffer *pClientBuffer )
-        : CBaseBackendFb( pClientBuffer )
+    CWaylandFb::CWaylandFb( CWaylandBackend *pBackend, wl_buffer *pHostBuffer )
+        : CBaseBackendFb()
         , m_pBackend     { pBackend }
         , m_pHostBuffer  { pHostBuffer }
     {
@@ -716,6 +875,8 @@ namespace gamescope
         assert( m_pHostBuffer );
         assert( m_pHostBuffer == pBuffer );
 
+        xdg_log.debugf( "buffer_release: %p", pBuffer );
+
         OnCompositorRelease();
     }
 
@@ -723,9 +884,12 @@ namespace gamescope
     // CWaylandConnector
     //////////////////
 
-    CWaylandConnector::CWaylandConnector( CWaylandBackend *pBackend )
-        : m_pBackend( pBackend )
+    CWaylandConnector::CWaylandConnector( CWaylandBackend *pBackend, uint64_t ulVirtualConnectorKey )
+        : CBaseBackendConnector{ ulVirtualConnectorKey }
+        , m_pBackend( pBackend )
+        , m_Planes{ this, this, this, this, this, this, this, this }
     {
+        m_HDRInfo.bAlwaysPatchEdid = true;
     }
 
     CWaylandConnector::~CWaylandConnector()
@@ -737,6 +901,165 @@ namespace gamescope
         m_FakeEdid = GenerateSimpleEdid( g_nNestedWidth, g_nNestedHeight );
 
         return true;
+    }
+
+    bool CWaylandConnector::Init()
+    {
+        for ( uint32_t i = 0; i < 8; i++ )
+        {
+            bool bSuccess = m_Planes[i].Init( i == 0 ? nullptr : &m_Planes[0], i == 0 ? nullptr : &m_Planes[ i - 1 ] );
+            if ( !bSuccess )
+                return false;
+        }
+
+        if ( g_bFullscreen )
+        {
+            m_bDesiredFullscreenState = true;
+            g_bFullscreen = false;
+            UpdateFullscreenState();
+        }
+
+        UpdateEdid();
+        m_pBackend->HackUpdatePatchedEdid();
+
+        if ( g_bForceRelativeMouse )
+            this->SetRelativeMouseMode( true );
+
+        return true;
+    }
+
+    void CWaylandConnector::SetFullscreen( bool bFullscreen )
+    {
+        m_bDesiredFullscreenState = bFullscreen;
+    }
+
+    void CWaylandConnector::UpdateFullscreenState()
+    {
+        if ( !m_bVisible )
+            g_bFullscreen = false;
+
+        if ( m_bDesiredFullscreenState != g_bFullscreen && m_bVisible )
+        {
+            if ( m_bDesiredFullscreenState )
+                libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), nullptr );
+            else
+                libdecor_frame_unset_fullscreen( m_Planes[0].GetFrame() );
+
+            g_bFullscreen = m_bDesiredFullscreenState;
+        }
+    }
+
+    int CWaylandConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
+    {
+        UpdateFullscreenState();
+
+        bool bNeedsFullComposite = false;
+
+        if ( !m_bVisible )
+        {
+            uint32_t uCurrentPlane = 0;
+            for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
+                m_Planes[uCurrentPlane++].Present( nullptr );
+        }
+        else
+        {
+            // TODO: Dedupe some of this composite check code between us and drm.cpp
+            bool bLayer0ScreenSize = close_enough(pFrameInfo->layers[0].scale.x, 1.0f) && close_enough(pFrameInfo->layers[0].scale.y, 1.0f);
+
+            bool bNeedsCompositeFromFilter = (g_upscaleFilter == GamescopeUpscaleFilter::NEAREST || g_upscaleFilter == GamescopeUpscaleFilter::PIXEL) && !bLayer0ScreenSize;
+
+            bNeedsFullComposite |= cv_composite_force;
+            bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
+            bNeedsFullComposite |= pFrameInfo->useNISLayer0;
+            bNeedsFullComposite |= pFrameInfo->blurLayer0;
+            bNeedsFullComposite |= bNeedsCompositeFromFilter;
+            bNeedsFullComposite |= g_bColorSliderInUse;
+            bNeedsFullComposite |= pFrameInfo->bFadingOut;
+            bNeedsFullComposite |= !g_reshade_effect.empty();
+
+            if ( g_bOutputHDREnabled )
+                bNeedsFullComposite |= g_bHDRItmEnable;
+
+            if ( !m_pBackend->SupportsColorManagement() )
+                bNeedsFullComposite |= ColorspaceIsHDR( pFrameInfo->layers[0].colorspace );
+
+            bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
+
+            if ( !bNeedsFullComposite )
+            {
+                bool bNeedsBacking = true;
+                if ( pFrameInfo->layerCount >= 1 )
+                {
+                    if ( pFrameInfo->layers[0].isScreenSize() && !pFrameInfo->layers[0].hasAlpha() )
+                        bNeedsBacking = false;
+                }
+
+                uint32_t uCurrentPlane = 0;
+                if ( bNeedsBacking )
+                {
+                    m_pBackend->GetBlackFb()->OnCompositorAcquire();
+
+                    CWaylandPlane *pPlane = &m_Planes[uCurrentPlane++];
+                    pPlane->Present(
+                        WaylandPlaneState
+                        {
+                            .pBuffer     = m_pBackend->GetBlackFb()->GetHostBuffer(),
+                            .flSrcWidth  = 1.0,
+                            .flSrcHeight = 1.0,
+                            .nDstWidth   = int32_t( g_nOutputWidth ),
+                            .nDstHeight  = int32_t( g_nOutputHeight ),
+                            .eColorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU,
+                            .bOpaque     = true,
+                            .uFractionalScale = pPlane->GetScale(),
+                        } );
+                }
+
+                for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
+                    m_Planes[uCurrentPlane++].Present( i < pFrameInfo->layerCount ? &pFrameInfo->layers[i] : nullptr );
+            }
+            else
+            {
+                std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false );
+
+                if ( !oCompositeResult )
+                {
+                    xdg_log.errorf( "vulkan_composite failed" );
+                    return -EINVAL;
+                }
+
+                vulkan_wait( *oCompositeResult, true );
+
+                FrameInfo_t::Layer_t compositeLayer{};
+                compositeLayer.scale.x = 1.0;
+                compositeLayer.scale.y = 1.0;
+                compositeLayer.opacity = 1.0;
+                compositeLayer.zpos = g_zposBase;
+
+                compositeLayer.tex = vulkan_get_last_output_image( false, false );
+                compositeLayer.applyColorMgmt = false;
+
+                compositeLayer.filter = GamescopeUpscaleFilter::NEAREST;
+                compositeLayer.ctm = nullptr;
+                compositeLayer.colorspace = pFrameInfo->outputEncodingEOTF == EOTF_PQ ? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+
+                m_Planes[0].Present( &compositeLayer );
+
+                for ( int i = 1; i < 8; i++ )
+                    m_Planes[i].Present( nullptr );
+            }
+        }
+
+        for ( int i = 7; i >= 0; i-- )
+            m_Planes[i].Commit();
+
+        wl_display_flush( m_pBackend->GetDisplay() );
+
+        GetVBlankTimer().UpdateWasCompositing( bNeedsFullComposite );
+        GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
+
+        m_pBackend->PollState();
+
+        return 0;
     }
 
     GamescopeScreenType CWaylandConnector::GetScreenType() const
@@ -760,6 +1083,10 @@ namespace gamescope
     {
         return m_HDRInfo;
     }
+    bool CWaylandConnector::IsVRRActive() const
+    {
+        return cv_adaptive_sync && m_bHostCompositorIsCurrentlyVRR;
+    }
     std::span<const BackendMode> CWaylandConnector::GetModes() const
     {
         return std::span<const BackendMode>{};
@@ -767,7 +1094,7 @@ namespace gamescope
 
     bool CWaylandConnector::SupportsVRR() const
     {
-        return m_pBackend->CurrentDisplaySupportsVRR();
+        return CurrentDisplaySupportsVRR();
     }
 
     std::span<const uint8_t> CWaylandConnector::GetRawEDID() const
@@ -784,19 +1111,124 @@ namespace gamescope
         displaycolorimetry_t *displayColorimetry, EOTF *displayEOTF,
         displaycolorimetry_t *outputEncodingColorimetry, EOTF *outputEncodingEOTF ) const
     {
-        if ( g_bForceHDR10OutputDebug )
+        *displayColorimetry = m_DisplayColorimetry;
+        *displayEOTF = EOTF_Gamma22;
+
+        if ( bHDR10 && GetHDRInfo().IsHDR10() )
         {
-            *displayColorimetry = displaycolorimetry_2020;
-            *displayEOTF = EOTF_PQ;
+            // For HDR10 output, expected content colorspace != native colorspace.
             *outputEncodingColorimetry = displaycolorimetry_2020;
-            *outputEncodingEOTF = EOTF_PQ;
+            *outputEncodingEOTF = GetHDRInfo().eOutputEncodingEOTF;
         }
         else
         {
-            *displayColorimetry = displaycolorimetry_709;
-            *displayEOTF = EOTF_Gamma22;
-            *outputEncodingColorimetry = displaycolorimetry_709;
+            // We always use default 'perceptual' intent, so
+            // this should be correct for SDR content.
+            *outputEncodingColorimetry = m_DisplayColorimetry;
             *outputEncodingEOTF = EOTF_Gamma22;
+        }
+    }
+
+
+    void CWaylandConnector::SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info )
+    {
+        m_pBackend->SetCursorImage( std::move( info ) );
+    }
+    void CWaylandConnector::SetRelativeMouseMode( bool bRelative )
+    {
+        // TODO: Do more tracking across multiple connectors, and activity here if we ever want to use this.
+        m_pBackend->SetRelativeMouseMode( m_Planes[0].GetSurface(), bRelative );
+    }
+    void CWaylandConnector::SetVisible( bool bVisible )
+    {
+        if ( m_bVisible == bVisible )
+            return;
+
+        m_bVisible = bVisible;
+        force_repaint();
+    }
+    void CWaylandConnector::SetTitle( std::shared_ptr<std::string> pAppTitle )
+    {
+        std::string szTitle = pAppTitle ? *pAppTitle : "gamescope";
+        if ( g_bGrabbed )
+            szTitle += " (grabbed)";
+        libdecor_frame_set_title( m_Planes[0].GetFrame(), szTitle.c_str() );
+    }
+    void CWaylandConnector::SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels )
+    {
+        if ( !m_pBackend->GetToplevelIconManager() )
+            return;
+
+        if ( uIconPixels && uIconPixels->size() >= 3 )
+        {
+            xdg_toplevel_icon_v1 *pIcon = xdg_toplevel_icon_manager_v1_create_icon( m_pBackend->GetToplevelIconManager() );
+            if ( !pIcon )
+            {
+                xdg_log.errorf( "Failed to create xdg_toplevel_icon_v1" );
+                return;
+            }
+            defer( xdg_toplevel_icon_v1_destroy( pIcon ) );
+
+            const uint32_t uWidth  = ( *uIconPixels )[0];
+            const uint32_t uHeight = ( *uIconPixels )[1];
+
+            const uint32_t uStride = uWidth * 4;
+            const uint32_t uSize   = uStride * uHeight;
+            int32_t nFd = CreateShmBuffer( uSize, &( *uIconPixels )[2] );
+            if ( nFd < 0 )
+            {
+                xdg_log.errorf( "Failed to create/map shm buffer" );
+                return;
+            }
+            defer( close( nFd ) );
+
+            wl_shm_pool *pPool = wl_shm_create_pool( m_pBackend->GetShm(), nFd, uSize );
+            defer( wl_shm_pool_destroy( pPool ) );
+
+            wl_buffer *pBuffer = wl_shm_pool_create_buffer( pPool, 0, uWidth, uHeight, uStride, WL_SHM_FORMAT_ARGB8888 );
+            defer( wl_buffer_destroy( pBuffer ) );
+
+            xdg_toplevel_icon_v1_add_buffer( pIcon, pBuffer, 1 );
+
+            xdg_toplevel_icon_manager_v1_set_icon( m_pBackend->GetToplevelIconManager(), m_Planes[0].GetXdgToplevel(), pIcon );
+        }
+        else
+        {
+            xdg_toplevel_icon_manager_v1_set_icon( m_pBackend->GetToplevelIconManager(), m_Planes[0].GetXdgToplevel(), nullptr );
+        }
+    }
+
+    void CWaylandConnector::SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection )
+    {
+        if ( m_pBackend->m_pDataDeviceManager && !m_pBackend->m_pDataDevice )
+            m_pBackend->m_pDataDevice = wl_data_device_manager_get_data_device( m_pBackend->m_pDataDeviceManager, m_pBackend->m_pSeat );
+
+        if ( m_pBackend->m_pPrimarySelectionDeviceManager && !m_pBackend->m_pPrimarySelectionDevice )
+            m_pBackend->m_pPrimarySelectionDevice = zwp_primary_selection_device_manager_v1_get_device( m_pBackend->m_pPrimarySelectionDeviceManager, m_pBackend->m_pSeat );
+
+        if ( eSelection == GAMESCOPE_SELECTION_CLIPBOARD && m_pBackend->m_pDataDevice )
+        {
+            m_pBackend->m_pClipboard = szContents;
+            wl_data_source *source = wl_data_device_manager_create_data_source( m_pBackend->m_pDataDeviceManager );
+            wl_data_source_add_listener( source, &m_pBackend->s_DataSourceListener, m_pBackend );
+            wl_data_source_offer( source, "text/plain" );
+            wl_data_source_offer( source, "text/plain;charset=utf-8" );
+            wl_data_source_offer( source, "TEXT" );
+            wl_data_source_offer( source, "STRING" );
+            wl_data_source_offer( source, "UTF8_STRING" );
+            wl_data_device_set_selection( m_pBackend->m_pDataDevice, source, m_pBackend->m_uKeyboardEnterSerial );
+        }
+        else if ( eSelection == GAMESCOPE_SELECTION_PRIMARY && m_pBackend->m_pPrimarySelectionDevice )
+        {
+            m_pBackend->m_pPrimarySelection = szContents;
+            zwp_primary_selection_source_v1 *source = zwp_primary_selection_device_manager_v1_create_source( m_pBackend->m_pPrimarySelectionDeviceManager );
+            zwp_primary_selection_source_v1_add_listener( source, &m_pBackend->s_PrimarySelectionSourceListener, m_pBackend );
+            zwp_primary_selection_source_v1_offer( source, "text/plain" );
+            zwp_primary_selection_source_v1_offer( source, "text/plain;charset=utf-8" );
+            zwp_primary_selection_source_v1_offer( source, "TEXT" );
+            zwp_primary_selection_source_v1_offer( source, "STRING" );
+            zwp_primary_selection_source_v1_offer( source, "UTF8_STRING" );
+            zwp_primary_selection_device_v1_set_selection( m_pBackend->m_pPrimarySelectionDevice, source, m_pBackend->m_uPointerEnterSerial );
         }
     }
 
@@ -804,24 +1236,60 @@ namespace gamescope
     // CWaylandPlane
     //////////////////
 
-    CWaylandPlane::CWaylandPlane( CWaylandBackend *pBackend )
-        : m_pBackend( pBackend )
+    CWaylandPlane::CWaylandPlane( CWaylandConnector *pConnector )
+        : m_pConnector{ pConnector }
+        , m_pBackend{ pConnector->GetBackend() }
     {
     }
 
     CWaylandPlane::~CWaylandPlane()
     {
+        std::scoped_lock lock{ m_PlaneStateLock };
+
+        m_eWindowState = LIBDECOR_WINDOW_STATE_NONE;
+        m_pOutputs.clear();
+        m_bNeedsDecorCommit = false;
+
+        m_oCurrentPlaneState = std::nullopt;
+
+        if ( m_pFrame )
+            libdecor_frame_unref( m_pFrame ); // Ew.
+
+        if ( m_pSubsurface )
+            wl_subsurface_destroy( m_pSubsurface );
+        if ( m_pFractionalScale )
+            wp_fractional_scale_v1_destroy( m_pFractionalScale );
+        if ( m_pXXColorManagedSurface )
+            xx_color_management_surface_v3_destroy( m_pXXColorManagedSurface );
+        if ( m_pFrogColorManagedSurface )
+            frog_color_managed_surface_destroy( m_pFrogColorManagedSurface );
+        if ( m_pViewport )
+            wp_viewport_destroy( m_pViewport );
+        if ( m_pSurface )
+            wl_surface_destroy( m_pSurface );
     }
 
     bool CWaylandPlane::Init( CWaylandPlane *pParent, CWaylandPlane *pSiblingBelow )
     {
         m_pParent = pParent;
         m_pSurface = wl_compositor_create_surface( m_pBackend->GetCompositor() );
+        wl_proxy_set_tag( (wl_proxy *)m_pSurface, &GAMESCOPE_plane_tag );
         wl_surface_set_user_data( m_pSurface, this );
+        wl_surface_add_listener( m_pSurface, &s_SurfaceListener, this );
 
         m_pViewport = wp_viewporter_get_viewport( m_pBackend->GetViewporter(), m_pSurface );
 
-        if ( m_pBackend->GetFrogColorManagementFactory() )
+        if ( m_pBackend->GetXXColorManager() )
+        {
+            m_pXXColorManagedSurface = xx_color_manager_v3_get_surface( m_pBackend->GetXXColorManager(), m_pSurface );
+
+            // Only add the listener for the toplevel to avoid useless spam.
+            if ( !pParent )
+                xx_color_management_surface_v3_add_listener( m_pXXColorManagedSurface, &s_XXColorManagementSurfaceListener, this );
+
+            UpdateXXPreferredColorManagement();
+        }
+        else if ( m_pBackend->GetFrogColorManagementFactory() )
         {
             m_pFrogColorManagedSurface = frog_color_management_factory_v1_get_color_managed_surface( m_pBackend->GetFrogColorManagementFactory(), m_pSurface );
 
@@ -886,7 +1354,11 @@ namespace gamescope
                 wp_presentation_feedback_add_listener( pFeedback, &s_PresentationFeedbackListener, this );
             }
 
-            if ( m_pFrogColorManagedSurface )
+            if ( m_pXXColorManagedSurface )
+            {
+                // TODO: Actually use this.
+            }
+            else if ( m_pFrogColorManagedSurface )
             {
                 frog_color_managed_surface_set_render_intent( m_pFrogColorManagedSurface, FROG_COLOR_MANAGED_SURFACE_RENDER_INTENT_PERCEPTUAL );
                 switch ( oState->eColorspace )
@@ -923,14 +1395,15 @@ namespace gamescope
                 wl_fixed_from_double( oState->flSrcHeight ) );
             wp_viewport_set_destination(
                 m_pViewport,
-                oState->nDstWidth  * 120 / uScale,
-                oState->nDstHeight * 120 / uScale);
+                WaylandScaleToLogical( oState->nDstWidth, uScale ),
+                WaylandScaleToLogical( oState->nDstHeight, uScale ) );
+
             if ( m_pSubsurface )
             {
                 wl_subsurface_set_position(
                     m_pSubsurface,
-                    oState->nDestX * 120 / uScale,
-                    oState->nDestY * 120 / uScale );
+                    WaylandScaleToLogical( oState->nDestX, uScale ),
+                    WaylandScaleToLogical( oState->nDestY, uScale ) );
             }
             // The x/y here does nothing? Why? What is it for...
             // Use the subsurface set_position thing instead.
@@ -948,7 +1421,10 @@ namespace gamescope
 
     void CWaylandPlane::CommitLibDecor( libdecor_configuration *pConfiguration )
     {
-        libdecor_state *pState = libdecor_state_new( g_nOutputWidth, g_nOutputHeight );
+        int32_t uScale = GetScale();
+        libdecor_state *pState = libdecor_state_new(
+            WaylandScaleToLogical( g_nOutputWidth, uScale ),
+            WaylandScaleToLogical( g_nOutputHeight, uScale ) );
         libdecor_frame_commit( m_pFrame, pState, pConfiguration );
         libdecor_state_free( pState );
     }
@@ -991,8 +1467,8 @@ namespace gamescope
                     .flSrcY      = 0.0,
                     .flSrcWidth  = double( pLayer->tex->width() ),
                     .flSrcHeight = double( pLayer->tex->height() ),
-                    .nDstWidth   = int32_t( pLayer->tex->width() / double( pLayer->scale.x ) ),
-                    .nDstHeight  = int32_t( pLayer->tex->height() / double( pLayer->scale.y ) ),
+                    .nDstWidth   = int32_t( ceil( pLayer->tex->width() / double( pLayer->scale.x ) ) ),
+                    .nDstHeight  = int32_t( ceil( pLayer->tex->height() / double( pLayer->scale.y ) ) ),
                     .eColorspace = pLayer->colorspace,
                     .bOpaque     = pLayer->zpos == g_zposBase,
                     .uFractionalScale = GetScale(),
@@ -1002,6 +1478,54 @@ namespace gamescope
         {
             Present( std::nullopt );
         }
+    }
+
+    void CWaylandPlane::UpdateVRRRefreshRate()
+    {
+        if ( m_pParent )
+            return;
+
+        if ( !m_pConnector->HostCompositorIsCurrentlyVRR() )
+            return;
+
+        if ( m_pOutputs.empty() )
+            return;
+
+        int32_t nLargestRefreshRateMhz = 0;
+        for ( wl_output *pOutput : m_pOutputs )
+        {
+            WaylandOutputInfo *pOutputInfo = m_pBackend->GetOutputInfo( pOutput );
+            if ( !pOutputInfo )
+                continue;
+
+            nLargestRefreshRateMhz = std::max( nLargestRefreshRateMhz, pOutputInfo->nRefresh );
+        }
+
+        if ( nLargestRefreshRateMhz && nLargestRefreshRateMhz != g_nOutputRefresh )
+        {
+            // TODO(strategy): We should pick the largest refresh rate.
+            xdg_log.infof( "Changed refresh to: %.3fhz", ConvertmHzToHz( (float) nLargestRefreshRateMhz ) );
+            g_nOutputRefresh = nLargestRefreshRateMhz;
+        }
+    }
+
+    void CWaylandPlane::Wayland_Surface_Enter( wl_surface *pSurface, wl_output *pOutput )
+    {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
+        m_pOutputs.emplace_back( pOutput );
+
+        UpdateVRRRefreshRate();
+    }
+    void CWaylandPlane::Wayland_Surface_Leave( wl_surface *pSurface, wl_output *pOutput )
+    {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
+        std::erase( m_pOutputs, pOutput );
+
+        UpdateVRRRefreshRate();
     }
 
     void CWaylandPlane::LibDecor_Frame_Configure( libdecor_frame *pFrame, libdecor_configuration *pConfiguration )
@@ -1014,11 +1538,15 @@ namespace gamescope
         int nWidth, nHeight;
         if ( !libdecor_configuration_get_content_size( pConfiguration, m_pFrame, &nWidth, &nHeight ) )
         {
-            nWidth  = g_nOutputWidth  * 120 / uScale;
-            nHeight = g_nOutputHeight * 120 / uScale;
+            // XXX(virtual connector): Move g_nOutputWidth etc to connector.
+            // Right now we are doubling this up when we should not be.
+            //
+            // Which is causing problems.
+            nWidth  = WaylandScaleToLogical( g_nOutputWidth, uScale );
+            nHeight = WaylandScaleToLogical( g_nOutputHeight, uScale );
         }
-        g_nOutputWidth  = nWidth  * uScale / 120;
-        g_nOutputHeight = nHeight * uScale / 120;
+        g_nOutputWidth  = WaylandScaleToPhysical( nWidth, uScale );
+        g_nOutputHeight = WaylandScaleToPhysical( nHeight, uScale );
 
         CommitLibDecor( pConfiguration );
 
@@ -1054,11 +1582,13 @@ namespace gamescope
                 g_nOutputRefresh = nRefresh;
             }
 
-            m_pBackend->SetHostCompositorIsCurrentlyVRR( false );
+            m_pConnector->SetHostCompositorIsCurrentlyVRR( false );
         }
         else
         {
-            m_pBackend->SetHostCompositorIsCurrentlyVRR( true );
+            m_pConnector->SetHostCompositorIsCurrentlyVRR( true );
+
+            UpdateVRRRefreshRate();
         }
 
         GetVBlankTimer().MarkVBlank( ulTime, true );
@@ -1090,12 +1620,18 @@ namespace gamescope
         uint32_t uMinLuminance,
         uint32_t uMaxFullFrameLuminance )
     {
-        auto *pHDRInfo = &m_pBackend->m_Connector.m_HDRInfo;
+        auto *pHDRInfo = &m_pConnector->m_HDRInfo;
         pHDRInfo->bExposeHDRSupport         = ( cv_hdr_enabled && uTransferFunction == FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_ST2084_PQ );
         pHDRInfo->eOutputEncodingEOTF       = ( cv_hdr_enabled && uTransferFunction == FROG_COLOR_MANAGED_SURFACE_TRANSFER_FUNCTION_ST2084_PQ ) ? EOTF_PQ : EOTF_Gamma22;
         pHDRInfo->uMaxContentLightLevel     = uMaxLuminance;
         pHDRInfo->uMaxFrameAverageLuminance = uMaxFullFrameLuminance;
         pHDRInfo->uMinContentLightLevel     = uMinLuminance;
+
+        auto *pDisplayColorimetry = &m_pConnector->m_DisplayColorimetry;
+        pDisplayColorimetry->primaries.r = glm::vec2{ uOutputDisplayPrimaryRedX * 0.00002f, uOutputDisplayPrimaryRedY * 0.00002f };
+        pDisplayColorimetry->primaries.g = glm::vec2{ uOutputDisplayPrimaryGreenX * 0.00002f, uOutputDisplayPrimaryGreenY * 0.00002f };
+        pDisplayColorimetry->primaries.b = glm::vec2{ uOutputDisplayPrimaryBlueX * 0.00002f, uOutputDisplayPrimaryBlueY * 0.00002f };
+        pDisplayColorimetry->white = glm::vec2{ uOutputWhitePointX * 0.00002f, uOutputWhitePointY * 0.00002f };
 
         xdg_log.infof( "PreferredMetadata: Red: %g %g, Green: %g %g, Blue: %g %g, White: %g %g, Max Luminance: %u nits, Min Luminance: %g nits, Max Full Frame Luminance: %u nits",
             uOutputDisplayPrimaryRedX * 0.00002, uOutputDisplayPrimaryRedY * 0.00002,
@@ -1106,6 +1642,87 @@ namespace gamescope
             uMinLuminance * 0.0001,
             uint32_t( uMaxFullFrameLuminance ) );
     }
+
+    //
+
+    void CWaylandPlane::Wayland_XXColorManagementSurface_PreferredChanged( xx_color_management_surface_v3 *pColorManagementSurface )
+    {
+        UpdateXXPreferredColorManagement();
+    }
+
+    void CWaylandPlane::UpdateXXPreferredColorManagement()
+    {
+        if ( m_pParent )
+            return;
+
+        xx_image_description_v3 *pImageDescription = xx_color_management_surface_v3_get_preferred( m_pXXColorManagedSurface );
+        xx_image_description_info_v3 *pImageDescInfo = xx_image_description_v3_get_information( pImageDescription );
+        static const xx_image_description_info_v3_listener s_Listener
+        {
+
+        };
+        xx_image_description_info_v3_add_listener( pImageDescInfo, &s_Listener, this );
+        wl_display_roundtrip( m_pBackend->GetDisplay() );
+
+        xx_image_description_info_v3_destroy( pImageDescInfo );
+        xx_image_description_v3_destroy( pImageDescription );
+    }
+
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_Done( xx_image_description_info_v3 *pImageDescInfo )
+    {
+        
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_ICCFile( xx_image_description_info_v3 *pImageDescInfo, int32_t nICCFd, uint32_t uICCSize )
+    {
+        if ( nICCFd >= 0 )
+            close( nICCFd );
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_Primaries( xx_image_description_info_v3 *pImageDescInfo, int32_t nRedX, int32_t nRedY, int32_t nGreenX, int32_t nGreenY, int32_t nBlueX, int32_t nBlueY, int32_t nWhiteX, int32_t nWhiteY )
+    {
+        
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_PrimariesNamed( xx_image_description_info_v3 *pImageDescInfo, uint32_t uPrimaries )
+    {
+        
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_TFPower( xx_image_description_info_v3 *pImageDescInfo, uint32_t uExp)
+    {
+        
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_TFNamed( xx_image_description_info_v3 *pImageDescInfo, uint32_t uTF)
+    {
+        auto *pHDRInfo = &m_pConnector->m_HDRInfo;
+        pHDRInfo->bExposeHDRSupport   = ( cv_hdr_enabled && uTF == XX_COLOR_MANAGER_V3_TRANSFER_FUNCTION_ST2084_PQ );
+        pHDRInfo->eOutputEncodingEOTF = ( cv_hdr_enabled && uTF == XX_COLOR_MANAGER_V3_TRANSFER_FUNCTION_ST2084_PQ ) ? EOTF_PQ : EOTF_Gamma22;
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_Luminances( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMinLum, uint32_t uMaxLum, uint32_t uRefLum )
+    {
+        
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_TargetPrimaries( xx_image_description_info_v3 *pImageDescInfo, int32_t nRedX, int32_t nRedY, int32_t nGreenX, int32_t nGreenY, int32_t nBlueX, int32_t nBlueY, int32_t nWhiteX, int32_t nWhiteY )
+    {
+        auto *pDisplayColorimetry = &m_pConnector->m_DisplayColorimetry;
+        pDisplayColorimetry->primaries.r = glm::vec2{ nRedX / 10000.0f, nRedY / 10000.0f };
+        pDisplayColorimetry->primaries.g = glm::vec2{ nGreenX / 10000.0f, nGreenY / 10000.0f };
+        pDisplayColorimetry->primaries.b = glm::vec2{ nBlueX / 10000.0f, nBlueY / 10000.0f };
+        pDisplayColorimetry->white = glm::vec2{ nWhiteX / 10000.0f, nWhiteY / 10000.0f };
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_TargetLuminance( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMinLum, uint32_t uMaxLum )
+    {
+        
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_Target_MaxCLL( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMaxCLL )
+    {
+        auto *pHDRInfo = &m_pConnector->m_HDRInfo;
+        pHDRInfo->uMaxContentLightLevel = uMaxCLL;
+    }
+    void CWaylandPlane::Wayland_XXImageDescriptionInfo_Target_MaxFALL( xx_image_description_info_v3 *pImageDescInfo, uint32_t uMaxFALL )
+    {
+        auto *pHDRInfo = &m_pConnector->m_HDRInfo;
+        pHDRInfo->uMaxFrameAverageLuminance = uMaxFALL;
+    }
+
+    //
 
     void CWaylandPlane::Wayland_FractionalScale_PreferredScale( wp_fractional_scale_v1 *pFractionalScale, uint32_t uScale )
     {
@@ -1133,8 +1750,6 @@ namespace gamescope
     };
 
     CWaylandBackend::CWaylandBackend()
-        : m_Connector( this )
-        , m_Planes{ this, this, this, this, this, this, this, this }
     {
     }
 
@@ -1188,6 +1803,39 @@ namespace gamescope
         wl_registry_destroy( pRegistry );
         pRegistry = nullptr;
 
+        if ( m_pXXColorManager )
+        {
+            m_XXColorManagerFeatures.bSupportsGamescopeColorManagement = [this]() -> bool
+            {
+                // Features
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.eFeatures, XX_COLOR_MANAGER_V3_FEATURE_PARAMETRIC ) )
+                    return false;
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.eFeatures, XX_COLOR_MANAGER_V3_FEATURE_SET_PRIMARIES ) )
+                    return false;
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.eFeatures, XX_COLOR_MANAGER_V3_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES ) )
+                    return false;
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.eFeatures, XX_COLOR_MANAGER_V3_FEATURE_EXTENDED_TARGET_VOLUME ) )
+                    return false;
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.eFeatures, XX_COLOR_MANAGER_V3_FEATURE_SET_LUMINANCES ) )
+                    return false;
+
+                // Transfer Functions
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.eTransferFunctions, XX_COLOR_MANAGER_V3_TRANSFER_FUNCTION_SRGB ) )
+                    return false;
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.eTransferFunctions, XX_COLOR_MANAGER_V3_TRANSFER_FUNCTION_ST2084_PQ ) )
+                    return false;
+                // TODO: Need scRGB 
+
+                // Primaries
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.ePrimaries, XX_COLOR_MANAGER_V3_PRIMARIES_SRGB ) )
+                    return false;
+                if ( !Algorithm::Contains( m_XXColorManagerFeatures.ePrimaries, XX_COLOR_MANAGER_V3_PRIMARIES_BT2020 ) )
+                    return false;
+
+                return true;
+            }();
+        }
+
         m_pLibDecor = libdecor_new( m_pDisplay, &s_LibDecorInterface );
         if ( !m_pLibDecor )
         {
@@ -1220,28 +1868,10 @@ namespace gamescope
         m_pFullRegion = wl_compositor_create_region( m_pCompositor );
         wl_region_add( m_pFullRegion, 0, 0, INT32_MAX, INT32_MAX );
 
-        for ( uint32_t i = 0; i < 8; i++ )
-            m_Planes[i].Init( i == 0 ? nullptr : &m_Planes[0], i == 0 ? nullptr : &m_Planes[ i - 1 ] );
-
-        m_Connector.UpdateEdid();
-        this->HackUpdatePatchedEdid();
-
-        if ( cv_hdr_enabled && m_Connector.GetHDRInfo().bExposeHDRSupport )
-        {
-            setenv( "DXVK_HDR", "1", false );
-        }
-
-        if ( g_bFullscreen )
-        {
-            m_bDesiredFullscreenState = true;
-            g_bFullscreen = false;
-            UpdateFullscreenState();
-        }
-
         if ( m_pSinglePixelBufferManager )
         {
             wl_buffer *pBlackBuffer = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer( m_pSinglePixelBufferManager, 0, 0, 0, ~0u );
-            m_pOwnedBlackFb = new CWaylandFb( this, pBlackBuffer, nullptr );
+            m_pOwnedBlackFb = new CWaylandFb( this, pBlackBuffer );
             m_BlackFb = m_pOwnedBlackFb.get();
         }
         else
@@ -1264,9 +1894,6 @@ namespace gamescope
         m_pDefaultCursorInfo = GetX11HostCursor();
         m_pDefaultCursorSurface = CursorInfoToSurface( m_pDefaultCursorInfo );
 
-        if ( g_bForceRelativeMouse )
-            this->SetRelativeMouseMode( true );
-
         return true;
     }
 
@@ -1285,23 +1912,33 @@ namespace gamescope
         return VK_IMAGE_LAYOUT_GENERAL;
     }
 
-    void CWaylandBackend::GetPreferredOutputFormat( VkFormat *pPrimaryPlaneFormat, VkFormat *pOverlayPlaneFormat ) const
+    void CWaylandBackend::GetPreferredOutputFormat( uint32_t *pPrimaryPlaneFormat, uint32_t *pOverlayPlaneFormat ) const
     {
-        VkFormat u8BitFormat = VK_FORMAT_UNDEFINED;
-        if ( SupportsFormat( DRM_FORMAT_ARGB8888 ) )
-            u8BitFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        // Prefer opaque for composition on the Wayland backend.
+
+        uint32_t u8BitFormat = DRM_FORMAT_INVALID;
+        if ( SupportsFormat( DRM_FORMAT_XRGB8888 ) )
+            u8BitFormat = DRM_FORMAT_XRGB8888;
+        else if ( SupportsFormat( DRM_FORMAT_XBGR8888 ) )
+            u8BitFormat = DRM_FORMAT_XBGR8888;        
+        else if ( SupportsFormat( DRM_FORMAT_ARGB8888 ) )
+            u8BitFormat = DRM_FORMAT_ARGB8888;
         else if ( SupportsFormat( DRM_FORMAT_ABGR8888 ) )
-            u8BitFormat = VK_FORMAT_R8G8B8A8_UNORM;
+            u8BitFormat = DRM_FORMAT_ABGR8888;
 
-        VkFormat u10BitFormat = VK_FORMAT_UNDEFINED;
-        if ( SupportsFormat( DRM_FORMAT_ABGR2101010 ) )
-            u10BitFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        uint32_t u10BitFormat = DRM_FORMAT_INVALID;
+        if ( SupportsFormat( DRM_FORMAT_XBGR2101010 ) )
+            u10BitFormat = DRM_FORMAT_XBGR2101010;
+        else if ( SupportsFormat( DRM_FORMAT_XRGB2101010 ) )
+            u10BitFormat = DRM_FORMAT_XRGB2101010;
+        else if ( SupportsFormat( DRM_FORMAT_ABGR2101010 ) )
+            u10BitFormat = DRM_FORMAT_ABGR2101010;
         else if ( SupportsFormat( DRM_FORMAT_ARGB2101010 ) )
-            u10BitFormat = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+            u10BitFormat = DRM_FORMAT_ARGB2101010;
 
-        assert( u8BitFormat != VK_FORMAT_UNDEFINED );
+        assert( u8BitFormat != DRM_FORMAT_INVALID );
 
-        *pPrimaryPlaneFormat = u10BitFormat != VK_FORMAT_UNDEFINED ? u10BitFormat : u8BitFormat;
+        *pPrimaryPlaneFormat = u10BitFormat != DRM_FORMAT_INVALID ? u10BitFormat : u8BitFormat;
         *pOverlayPlaneFormat = u8BitFormat;
     }
 
@@ -1310,118 +1947,6 @@ namespace gamescope
         return true;
     }
 
-    int CWaylandBackend::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
-    {
-        UpdateFullscreenState();
-
-        bool bNeedsFullComposite = false;
-
-        if ( !m_bVisible )
-        {
-            uint32_t uCurrentPlane = 0;
-            for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
-                m_Planes[uCurrentPlane++].Present( nullptr );
-        }
-        else
-        {
-            // TODO: Dedupe some of this composite check code between us and drm.cpp
-            bool bLayer0ScreenSize = close_enough(pFrameInfo->layers[0].scale.x, 1.0f) && close_enough(pFrameInfo->layers[0].scale.y, 1.0f);
-
-            bool bNeedsCompositeFromFilter = (g_upscaleFilter == GamescopeUpscaleFilter::NEAREST || g_upscaleFilter == GamescopeUpscaleFilter::PIXEL) && !bLayer0ScreenSize;
-
-            bNeedsFullComposite |= cv_composite_force;
-            bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
-            bNeedsFullComposite |= pFrameInfo->useNISLayer0;
-            bNeedsFullComposite |= pFrameInfo->blurLayer0;
-            bNeedsFullComposite |= bNeedsCompositeFromFilter;
-            bNeedsFullComposite |= g_bColorSliderInUse;
-            bNeedsFullComposite |= pFrameInfo->bFadingOut;
-            bNeedsFullComposite |= !g_reshade_effect.empty();
-
-            if ( g_bOutputHDREnabled )
-                bNeedsFullComposite |= g_bHDRItmEnable;
-
-            if ( !SupportsColorManagement() )
-                bNeedsFullComposite |= ColorspaceIsHDR( pFrameInfo->layers[0].colorspace );
-
-            bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
-
-            if ( !bNeedsFullComposite )
-            {
-                bool bNeedsBacking = true;
-                if ( pFrameInfo->layerCount >= 1 )
-                {
-                    if ( pFrameInfo->layers[0].isScreenSize() && !pFrameInfo->layers[0].hasAlpha() )
-                        bNeedsBacking = false;
-                }
-
-                uint32_t uCurrentPlane = 0;
-                if ( bNeedsBacking )
-                {
-                    m_BlackFb->OnCompositorAcquire();
-
-                    CWaylandPlane *pPlane = &m_Planes[uCurrentPlane++];
-                    pPlane->Present(
-                        WaylandPlaneState
-                        {
-                            .pBuffer     = m_BlackFb->GetHostBuffer(),
-                            .flSrcWidth  = 1.0,
-                            .flSrcHeight = 1.0,
-                            .nDstWidth   = int32_t( g_nOutputWidth ),
-                            .nDstHeight  = int32_t( g_nOutputHeight ),
-                            .eColorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_PASSTHRU,
-                            .bOpaque     = true,
-                            .uFractionalScale = pPlane->GetScale(),
-                        } );
-                }
-
-                for ( int i = 0; i < 8 && uCurrentPlane < 8; i++ )
-                    m_Planes[uCurrentPlane++].Present( i < pFrameInfo->layerCount ? &pFrameInfo->layers[i] : nullptr );
-            }
-            else
-            {
-                std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false );
-
-                if ( !oCompositeResult )
-                {
-                    xdg_log.errorf( "vulkan_composite failed" );
-                    return -EINVAL;
-                }
-
-                vulkan_wait( *oCompositeResult, true );
-
-                FrameInfo_t::Layer_t compositeLayer{};
-                compositeLayer.scale.x = 1.0;
-                compositeLayer.scale.y = 1.0;
-                compositeLayer.opacity = 1.0;
-                compositeLayer.zpos = g_zposBase;
-
-                compositeLayer.tex = vulkan_get_last_output_image( false, false );
-                compositeLayer.applyColorMgmt = false;
-
-                compositeLayer.filter = GamescopeUpscaleFilter::NEAREST;
-                compositeLayer.ctm = nullptr;
-                compositeLayer.colorspace = pFrameInfo->outputEncodingEOTF == EOTF_PQ ? GAMESCOPE_APP_TEXTURE_COLORSPACE_HDR10_PQ : GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
-
-                m_Planes[0].Present( &compositeLayer );
-
-                for ( int i = 1; i < 8; i++ )
-                    m_Planes[i].Present( nullptr );
-            }
-        }
-
-        for ( int i = 7; i >= 0; i-- )
-            m_Planes[i].Commit();
-
-        wl_display_flush( m_pDisplay );
-
-        GetVBlankTimer().UpdateWasCompositing( bNeedsFullComposite );
-        GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
-
-        this->PollState();
-
-        return 0;
-    }
     void CWaylandBackend::DirtyState( bool bForce, bool bForceModeset )
     {
     }
@@ -1495,7 +2020,7 @@ namespace gamescope
 
         zwp_linux_buffer_params_v1_destroy( pBufferParams );
 
-        return new CWaylandFb{ this, pImportedBuffer, pClientBuffer };
+        return new CWaylandFb{ this, pImportedBuffer };
     }
 
     bool CWaylandBackend::UsesModifiers() const
@@ -1503,13 +2028,10 @@ namespace gamescope
         if ( !cv_wayland_use_modifiers )
             return false;
 
-        return !m_FormatModifiers.empty();
+        return m_bCanUseModifiers;
     }
     std::span<const uint64_t> CWaylandBackend::GetSupportedModifiers( uint32_t uDrmFormat ) const
     {
-        if ( !UsesModifiers() )
-            return std::span<const uint64_t>{};
-
         auto iter = m_FormatModifiers.find( uDrmFormat );
         if ( iter == m_FormatModifiers.end() )
             return std::span<const uint64_t>{};
@@ -1519,18 +2041,14 @@ namespace gamescope
 
     IBackendConnector *CWaylandBackend::GetCurrentConnector()
     {
-        return &m_Connector;
+        return m_pFocusConnector.get();
     }
     IBackendConnector *CWaylandBackend::GetConnector( GamescopeScreenType eScreenType )
     {
         if ( eScreenType == GAMESCOPE_SCREEN_TYPE_INTERNAL )
-            return &m_Connector;
+            return GetCurrentConnector();
 
         return nullptr;
-    }
-    bool CWaylandBackend::IsVRRActive() const
-    {
-        return g_bAllowVRR && m_bHostCompositorIsCurrentlyVRR;
     }
 
     bool CWaylandBackend::SupportsPlaneHardwareCursor() const
@@ -1556,13 +2074,8 @@ namespace gamescope
 
     bool CWaylandBackend::SupportsExplicitSync() const
     {
-        // Not right now, we need guarantee that no implicit
-        // sync is going to happen somehow.
-        //
-        // TODO: Perhaps we can check for host compositor
-        // syncobj stuff here and make that work?
-        return false;
-    }
+        return true;
+    }   
 
     bool CWaylandBackend::IsVisible() const
     {
@@ -1579,159 +2092,41 @@ namespace gamescope
         if ( !GetCurrentConnector() )
             return;
 
+        // XXX: We should do this a better way that handles per-window and appid stuff
+        // down the line
+        if ( cv_hdr_enabled && GetCurrentConnector()->GetHDRInfo().bExposeHDRSupport )
+        {
+            setenv( "DXVK_HDR", "1", true );
+        }
+        else
+        {
+            setenv( "DXVK_HDR", "0", true );
+        }
+
         WritePatchedEdid( GetCurrentConnector()->GetRawEDID(), GetCurrentConnector()->GetHDRInfo(), false );
     }
 
-    INestedHints *CWaylandBackend::GetNestedHints()
+    bool CWaylandBackend::UsesVirtualConnectors()
     {
-        return this;
+        return true;
+    }
+    std::shared_ptr<IBackendConnector> CWaylandBackend::CreateVirtualConnector( uint64_t ulVirtualConnectorKey )
+    {
+        std::shared_ptr<CWaylandConnector> pConnector = std::make_shared<CWaylandConnector>( this, ulVirtualConnectorKey );
+        if ( !m_pFocusConnector )
+            m_pFocusConnector = pConnector;
+
+        if ( !pConnector->Init() )
+        {
+            return nullptr;
+        }
+
+        return pConnector;
     }
 
     ///////////////////
     // INestedHints
     ///////////////////
-
-    static int CreateShmBuffer( uint32_t uSize, void *pData )
-    {
-        static constexpr char szTemplate[] = "/gamescope-shared-XXXXXX";
-
-        const char *pXDGPath = getenv( "XDG_RUNTIME_DIR" );
-        if ( !pXDGPath || !*pXDGPath )
-            return -1;
-
-        char szPath[ PATH_MAX ];
-        snprintf( szPath, PATH_MAX, "%s%s", pXDGPath, szTemplate );
-
-        int nFd = mkostemp( szPath, O_CLOEXEC );
-        if ( nFd < 0 )
-            return -1;
-
-        if ( ftruncate( nFd, uSize ) < 0 )
-        {
-            close( nFd );
-            return -1;
-        }
-
-        if ( pData )
-        {
-            void *pMappedData = mmap( nullptr, uSize, PROT_READ | PROT_WRITE, MAP_SHARED, nFd, 0 );
-            if ( pMappedData == MAP_FAILED )
-                return -1;
-            defer( munmap( pMappedData, uSize ) );
-
-            memcpy( pMappedData, pData, uSize );
-        }
-
-        return nFd;
-    }
-
-    void CWaylandBackend::SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info )
-    {
-        m_pCursorInfo = info;
-
-        if ( m_pCursorSurface )
-        {
-            wl_surface_destroy( m_pCursorSurface );
-            m_pCursorSurface = nullptr;
-        }
-
-        m_pCursorSurface = CursorInfoToSurface( info );
-
-        UpdateCursor();
-    }
-    void CWaylandBackend::SetRelativeMouseMode( bool bRelative )
-    {
-        if ( !m_pPointer )
-            return;
-
-        if ( !!bRelative != !!m_pLockedPointer )
-        {
-            if ( m_pLockedPointer )
-            {
-                assert( m_pRelativePointer );
-
-                zwp_locked_pointer_v1_destroy( m_pLockedPointer );
-                m_pLockedPointer = nullptr;
-
-                zwp_relative_pointer_v1_destroy( m_pRelativePointer );
-                m_pRelativePointer = nullptr;
-            }
-            else
-            {
-                assert( !m_pRelativePointer );
-
-                m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, m_Planes[0].GetSurface(), m_pPointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
-                m_pRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
-            }
-
-            m_InputThread.SetRelativePointer( bRelative );
-
-            UpdateCursor();
-        }
-    }
-    void CWaylandBackend::SetVisible( bool bVisible )
-    {
-        if ( m_bVisible == bVisible )
-            return;
-
-        m_bVisible = bVisible;
-        force_repaint();
-    }
-    void CWaylandBackend::SetTitle( std::shared_ptr<std::string> pAppTitle )
-    {
-        std::string szTitle = pAppTitle ? *pAppTitle : "gamescope";
-        if ( g_bGrabbed )
-            szTitle += " (grabbed)";
-        libdecor_frame_set_title( m_Planes[0].GetFrame(), szTitle.c_str() );
-    }
-    void CWaylandBackend::SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels )
-    {
-        if ( !m_pToplevelIconManager )
-            return;
-
-        if ( uIconPixels && uIconPixels->size() >= 3 )
-        {
-            xdg_toplevel_icon_v1 *pIcon = xdg_toplevel_icon_manager_v1_create_icon( m_pToplevelIconManager );
-            if ( !pIcon )
-            {
-                xdg_log.errorf( "Failed to create xdg_toplevel_icon_v1" );
-                return;
-            }
-            defer( xdg_toplevel_icon_v1_destroy( pIcon ) );
-
-            const uint32_t uWidth  = ( *uIconPixels )[0];
-            const uint32_t uHeight = ( *uIconPixels )[1];
-
-            const uint32_t uStride = uWidth * 4;
-            const uint32_t uSize   = uStride * uHeight;
-            int32_t nFd = CreateShmBuffer( uSize, &( *uIconPixels )[2] );
-            if ( nFd < 0 )
-            {
-                xdg_log.errorf( "Failed to create/map shm buffer" );
-                return;
-            }
-            defer( close( nFd ) );
-
-            wl_shm_pool *pPool = wl_shm_create_pool( m_pShm, nFd, uSize );
-            defer( wl_shm_pool_destroy( pPool ) );
-
-            wl_buffer *pBuffer = wl_shm_pool_create_buffer( pPool, 0, uWidth, uHeight, uStride, WL_SHM_FORMAT_ARGB8888 );
-            defer( wl_buffer_destroy( pBuffer ) );
-
-            xdg_toplevel_icon_v1_add_buffer( pIcon, pBuffer, 1 );
-
-            xdg_toplevel_icon_manager_v1_set_icon( m_pToplevelIconManager, m_Planes[0].GetXdgToplevel(), pIcon );
-        }
-        else
-        {
-            xdg_toplevel_icon_manager_v1_set_icon( m_pToplevelIconManager, m_Planes[0].GetXdgToplevel(), nullptr );
-        }
-    }
-
-    std::shared_ptr<INestedHints::CursorInfo> CWaylandBackend::GetHostCursor()
-    {
-        return m_pDefaultCursorInfo;
-    }
 
     void CWaylandBackend::OnBackendBlobDestroyed( BackendBlob *pBlob )
     {
@@ -1767,7 +2162,52 @@ namespace gamescope
 
     bool CWaylandBackend::SupportsColorManagement() const
     {
-        return m_pFrogColorMgmtFactory != nullptr;
+        return m_pFrogColorMgmtFactory != nullptr || ( m_pXXColorManager != nullptr && m_XXColorManagerFeatures.bSupportsGamescopeColorManagement );
+    }
+
+    void CWaylandBackend::SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info )
+    {
+        m_pCursorInfo = info;
+
+        if ( m_pCursorSurface )
+        {
+            wl_surface_destroy( m_pCursorSurface );
+            m_pCursorSurface = nullptr;
+        }
+
+        m_pCursorSurface = CursorInfoToSurface( info );
+
+        UpdateCursor();
+    }
+    void CWaylandBackend::SetRelativeMouseMode( wl_surface *pSurface, bool bRelative )
+    {
+        if ( !m_pPointer )
+            return;
+
+        if ( !!bRelative != !!m_pLockedPointer )
+        {
+            if ( m_pLockedPointer )
+            {
+                assert( m_pRelativePointer );
+
+                zwp_locked_pointer_v1_destroy( m_pLockedPointer );
+                m_pLockedPointer = nullptr;
+
+                zwp_relative_pointer_v1_destroy( m_pRelativePointer );
+                m_pRelativePointer = nullptr;
+            }
+            else
+            {
+                assert( !m_pRelativePointer );
+
+                m_pLockedPointer = zwp_pointer_constraints_v1_lock_pointer( m_pPointerConstraints, pSurface, m_pPointer, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT );
+                m_pRelativePointer = zwp_relative_pointer_manager_v1_get_relative_pointer( m_pRelativePointerManager, m_pPointer );
+            }
+
+            m_InputThread.SetRelativePointer( bRelative );
+
+            UpdateCursor();
+        }
     }
 
     void CWaylandBackend::UpdateCursor()
@@ -1792,31 +2232,6 @@ namespace gamescope
             else
                 wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pCursorSurface, m_pCursorInfo->uXHotspot, m_pCursorInfo->uYHotspot );
         }
-    }
-
-    void CWaylandBackend::SetFullscreen( bool bFullscreen )
-    {
-        m_bDesiredFullscreenState = bFullscreen;
-    }
-
-    void CWaylandBackend::UpdateFullscreenState()
-    {
-        if ( m_bDesiredFullscreenState != g_bFullscreen )
-        {
-            if ( m_bDesiredFullscreenState )
-                libdecor_frame_set_fullscreen( m_Planes[0].GetFrame(), nullptr );
-            else
-                libdecor_frame_unset_fullscreen( m_Planes[0].GetFrame() );
-
-            g_bFullscreen = m_bDesiredFullscreenState;
-        }
-    }
-
-    bool CWaylandBackend::SupportsFormat( uint32_t uDRMFormat ) const
-    {
-        return UsesModifiers()
-            ? m_FormatModifiers.contains( uDRMFormat )
-            : m_ModifierlessFormats.contains( uDRMFormat );
     }
 
     /////////////////////
@@ -1882,6 +2297,11 @@ namespace gamescope
         {
             m_pFrogColorMgmtFactory = (frog_color_management_factory_v1 *)wl_registry_bind( pRegistry, uName, &frog_color_management_factory_v1_interface, 1u );
         }
+        else if ( !strcmp( pInterface, xx_color_manager_v3_interface.name ) )
+        {
+            m_pXXColorManager = (xx_color_manager_v3 *)wl_registry_bind( pRegistry, uName, &xx_color_manager_v3_interface, 1u );
+            xx_color_manager_v3_add_listener( m_pXXColorManager, &s_XXColorManagerListener, this );
+        }
         else if ( !strcmp( pInterface, zwp_pointer_constraints_v1_interface.name ) )
         {
             m_pPointerConstraints = (zwp_pointer_constraints_v1 *)wl_registry_bind( pRegistry, uName, &zwp_pointer_constraints_v1_interface, 1u );
@@ -1902,16 +2322,34 @@ namespace gamescope
         {
             m_pToplevelIconManager = (xdg_toplevel_icon_manager_v1 *)wl_registry_bind( pRegistry, uName, &xdg_toplevel_icon_manager_v1_interface, 1u );
         }
+        else if ( !strcmp( pInterface, wl_data_device_manager_interface.name ) )
+        {
+            m_pDataDeviceManager = (wl_data_device_manager *)wl_registry_bind( pRegistry, uName, &wl_data_device_manager_interface, 3u );
+        }
+        else if ( !strcmp( pInterface, zwp_primary_selection_device_manager_v1_interface.name ) )
+        {
+            m_pPrimarySelectionDeviceManager = (zwp_primary_selection_device_manager_v1 *)wl_registry_bind( pRegistry, uName, &zwp_primary_selection_device_manager_v1_interface, 1u );
+        }
     }
 
     void CWaylandBackend::Wayland_Modifier( zwp_linux_dmabuf_v1 *pDmabuf, uint32_t uFormat, uint32_t uModifierHi, uint32_t uModifierLo )
     {
         uint64_t ulModifier = ( uint64_t( uModifierHi ) << 32 ) | uModifierLo;
-        //xdg_log.infof( "Modifier: %s (0x%" PRIX32 ") %lx", drmGetFormatName( uFormat ), uFormat, ulModifier );
+
+#if 0
+        const char *pszExtraModifierName = "";
+        if ( ulModifier == DRM_FORMAT_MOD_INVALID )
+            pszExtraModifierName = " (Invalid)";
+        if ( ulModifier == DRM_FORMAT_MOD_LINEAR )
+            pszExtraModifierName = " (Invalid)";
+
+        xdg_log.infof( "Modifier: %s (0x%" PRIX32 ") %lx%s", drmGetFormatName( uFormat ), uFormat, ulModifier, pszExtraModifierName );
+#endif
+
         if ( ulModifier != DRM_FORMAT_MOD_INVALID )
-            m_FormatModifiers[uFormat].emplace_back( ulModifier );
-        else
-            m_ModifierlessFormats.emplace( uFormat );
+            m_bCanUseModifiers = true;
+
+        m_FormatModifiers[uFormat].emplace_back( ulModifier );
     }
 
     // Output
@@ -1974,6 +2412,9 @@ namespace gamescope
 
     void CWaylandBackend::Wayland_Pointer_Enter( wl_pointer *pPointer, uint32_t uSerial, wl_surface *pSurface, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
     {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
         m_uPointerEnterSerial = uSerial;
         m_bMouseEntered = true;
 
@@ -1981,6 +2422,9 @@ namespace gamescope
     }
     void CWaylandBackend::Wayland_Pointer_Leave( wl_pointer *pPointer, uint32_t uSerial, wl_surface *pSurface )
     {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
         m_bMouseEntered = false;
     }
 
@@ -1988,15 +2432,69 @@ namespace gamescope
 
     void CWaylandBackend::Wayland_Keyboard_Enter( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface, wl_array *pKeys )
     {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
+        m_uKeyboardEnterSerial = uSerial;
         m_bKeyboardEntered = true;
-        
+
         UpdateCursor();
     }
     void CWaylandBackend::Wayland_Keyboard_Leave( wl_keyboard *pKeyboard, uint32_t uSerial, wl_surface *pSurface )
     {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
         m_bKeyboardEntered = false;
-        
+
         UpdateCursor();
+    }
+
+    // XX Color Manager
+
+    void CWaylandBackend::Wayland_XXColorManager_SupportedIntent( xx_color_manager_v3 *pXXColorManager, uint32_t uRenderIntent )
+    {
+        m_XXColorManagerFeatures.eRenderIntents.push_back( static_cast<xx_color_manager_v3_render_intent>( uRenderIntent ) );
+    }
+    void CWaylandBackend::Wayland_XXColorManager_SupportedFeature( xx_color_manager_v3 *pXXColorManager, uint32_t uFeature )
+    {
+        m_XXColorManagerFeatures.eFeatures.push_back( static_cast<xx_color_manager_v3_feature>( uFeature ) );
+    }
+    void CWaylandBackend::Wayland_XXColorManager_SupportedTFNamed( xx_color_manager_v3 *pXXColorManager, uint32_t uTF )
+    {
+        m_XXColorManagerFeatures.eTransferFunctions.push_back( static_cast<xx_color_manager_v3_transfer_function>( uTF ) );
+    }
+    void CWaylandBackend::Wayland_XXColorManager_SupportedPrimariesNamed( xx_color_manager_v3 *pXXColorManager, uint32_t uPrimaries )
+    {
+        m_XXColorManagerFeatures.ePrimaries.push_back( static_cast<xx_color_manager_v3_primaries>( uPrimaries ) );
+    }
+
+    // Data Source
+
+    void CWaylandBackend::Wayland_DataSource_Send( struct wl_data_source *pSource, const char *pMime, int nFd )
+    {
+        ssize_t len = m_pClipboard->length();
+        if ( write( nFd, m_pClipboard->c_str(), len ) != len )
+            xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
+        close( nFd );
+    }
+    void CWaylandBackend::Wayland_DataSource_Cancelled( struct wl_data_source *pSource )
+    {
+        wl_data_source_destroy( pSource );
+    }
+
+    // Primary Selection Source
+
+    void CWaylandBackend::Wayland_PrimarySelectionSource_Send( struct zwp_primary_selection_source_v1 *pSource, const char *pMime, int nFd )
+    {
+	ssize_t len = m_pPrimarySelection->length();
+        if ( write( nFd, m_pPrimarySelection->c_str(), len ) != len )
+	    xdg_log.infof( "Failed to write all %zd bytes to clipboard", len );
+        close( nFd );
+    }
+    void CWaylandBackend::Wayland_PrimarySelectionSource_Cancelled( struct zwp_primary_selection_source_v1 *pSource)
+    {
+        zwp_primary_selection_source_v1_destroy( pSource );
     }
 
     ///////////////////////
@@ -2152,7 +2650,7 @@ namespace gamescope
                 {
                     if ( !bPressed )
                     {
-                        m_pBackend->SetFullscreen( !g_bFullscreen );
+                        static_cast< CWaylandConnector * >( m_pBackend->GetCurrentConnector() )->SetFullscreen( !g_bFullscreen );
                     }
                     return;
                 }
@@ -2289,6 +2787,9 @@ namespace gamescope
 
     void CWaylandInputThread::Wayland_Pointer_Enter( wl_pointer *pPointer, uint32_t uSerial, wl_surface *pSurface, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
     {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
         CWaylandPlane *pPlane = (CWaylandPlane *)wl_surface_get_user_data( pSurface );
         if ( !pPlane )
             return;
@@ -2300,6 +2801,9 @@ namespace gamescope
     }
     void CWaylandInputThread::Wayland_Pointer_Leave( wl_pointer *pPointer, uint32_t uSerial, wl_surface *pSurface )
     {
+        if ( !IsSurfacePlane( pSurface ) )
+            return;
+
         CWaylandPlane *pPlane = (CWaylandPlane *)wl_surface_get_user_data( pSurface );
         if ( !pPlane )
             return;
@@ -2402,7 +2906,7 @@ namespace gamescope
         defer( close( nFd ) );
         assert( uFormat == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 );
 
-        char *pMap = (char *)mmap( nullptr, uSize, PROT_READ, MAP_SHARED, nFd, 0 );
+        char *pMap = (char *)mmap( nullptr, uSize, PROT_READ, MAP_PRIVATE, nFd, 0 );
         if ( !pMap || pMap == MAP_FAILED )
         {
             xdg_log.errorf( "Failed to map keymap fd." );

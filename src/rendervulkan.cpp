@@ -12,6 +12,7 @@
 #include <thread>
 #include <dlfcn.h>
 #include "vulkan_include.h"
+#include "Utils/Algorithm.h"
 
 #if defined(__linux__)
 #include <sys/sysmacros.h>
@@ -35,6 +36,7 @@
 #include "main.hpp"
 #include "steamcompmgr.hpp"
 #include "log.hpp"
+#include "Utils/Process.h"
 
 #include "cs_composite_blit.h"
 #include "cs_composite_blur.h"
@@ -76,7 +78,7 @@ static constexpr mat3x4 g_rgb2yuv_srgb_to_bt709_limited = {{
 static constexpr mat3x4 g_rgb2yuv_srgb_to_bt709_full = {{
   { 0.2126f, 0.7152f, 0.0722f, 0.0f },
   { -0.1146f, -0.3854f, 0.5000f, 0.5f },
-  { 0.5000f, -0.4542f, -0.0468f, 0.5f },
+  { 0.5000f, -0.4542f, -0.0458f, 0.5f },
 }};
 
 static const mat3x4& colorspace_to_conversion_from_srgb_matrix(EStreamColorspace colorspace) {
@@ -121,14 +123,8 @@ VulkanOutput_t g_output;
 uint32_t g_uCompositeDebug = 0u;
 gamescope::ConVar<uint32_t> cv_composite_debug{ "composite_debug", 0, "Debug composition flags" };
 
-template <typename T>
-static bool Contains( const std::span<const T> x, T value )
-{
-	return std::ranges::any_of( x, std::bind_front(std::equal_to{}, value) );
-}
-
 static std::map< VkFormat, std::map< uint64_t, VkDrmFormatModifierPropertiesEXT > > DRMModifierProps = {};
-static std::vector< uint32_t > sampledShmFormats{};
+static struct wlr_drm_format_set sampledShmFormats = {};
 static struct wlr_drm_format_set sampledDRMFormats = {};
 
 static LogScope vk_log("vulkan");
@@ -217,11 +213,11 @@ struct {
 	{ DRM_FORMAT_INVALID, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED, false, true },
 };
 
-uint32_t VulkanFormatToDRM( VkFormat vkFormat )
+uint32_t VulkanFormatToDRM( VkFormat vkFormat, std::optional<bool> obHasAlphaOverride )
 {
 	for ( int i = 0; s_DRMVKFormatTable[i].vkFormat != VK_FORMAT_UNDEFINED; i++ )
 	{
-		if ( s_DRMVKFormatTable[i].vkFormat == vkFormat || s_DRMVKFormatTable[i].vkFormatSrgb == vkFormat )
+		if ( ( s_DRMVKFormatTable[i].vkFormat == vkFormat || s_DRMVKFormatTable[i].vkFormatSrgb == vkFormat ) && ( !obHasAlphaOverride || s_DRMVKFormatTable[i].bHasAlpha == *obHasAlphaOverride ) )
 		{
 			return s_DRMVKFormatTable[i].DRMFormat;
 		}
@@ -367,7 +363,7 @@ bool CVulkanDevice::selectPhysDev(VkSurfaceKHR surface)
 						vk.GetPhysicalDeviceSurfaceSupportKHR( cphysDev, computeOnlyIndex, surface, &canPresent );
 						if ( !canPresent )
 						{
-							vk_log.debugf( "physical device %04x:%04x compute queue doesn't support presenting on our surface, using graphics queue", deviceProperties.vendorID, deviceProperties.deviceID );
+							vk_log.infof( "physical device %04x:%04x compute queue doesn't support presenting on our surface, using graphics queue", deviceProperties.vendorID, deviceProperties.deviceID );
 							computeOnlyIndex = ~0u;
 						}
 					}
@@ -515,14 +511,14 @@ bool CVulkanDevice::createDevice()
 	{
 		{
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-			.pNext = g_bNiceCap ? &queueCreateInfoEXT : nullptr,
+			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
 			.queueFamilyIndex = m_queueFamily,
 			.queueCount = 1,
 			.pQueuePriorities = &queuePriorities
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-			.pNext = g_bNiceCap ? &queueCreateInfoEXT : nullptr,
+			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
 			.queueFamilyIndex = m_generalQueueFamily,
 			.queueCount = 1,
 			.pQueuePriorities = &queuePriorities
@@ -548,6 +544,8 @@ bool CVulkanDevice::createDevice()
 
 	enabledExtensions.push_back( VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME );
 	enabledExtensions.push_back( VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME );
+
+	enabledExtensions.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
 
 	enabledExtensions.push_back( VK_EXT_ROBUSTNESS_2_EXTENSION_NAME );
 #if 0
@@ -625,14 +623,14 @@ bool CVulkanDevice::createDevice()
 	};
 
 	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
-	if ( res == VK_ERROR_NOT_PERMITTED_KHR && g_bNiceCap )
+	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
 	{
 		fprintf(stderr, "vkCreateDevice failed with a high-priority queue (general + compute). Falling back to regular priority (general).\n");
 		queueCreateInfos[1].pNext = nullptr;
 		res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
 
 
-		if ( res == VK_ERROR_NOT_PERMITTED_KHR && g_bNiceCap )
+		if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
 		{
 			fprintf(stderr, "vkCreateDevice failed with a high-priority queue (compute). Falling back to regular priority (all).\n");
 			queueCreateInfos[0].pNext = nullptr;
@@ -1237,13 +1235,36 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	// This is the seq no of the command buffer we are going to submit.
 	const uint64_t nextSeqNo = lastSubmissionSeqNo + 1;
 
+	std::vector<VkSemaphore> pSignalSemaphores;
+	std::vector<uint64_t> ulSignalPoints;
+
+	std::vector<VkPipelineStageFlags> uWaitStageFlags;
+	std::vector<VkSemaphore> pWaitSemaphores;
+	std::vector<uint64_t> ulWaitPoints;
+
+	pSignalSemaphores.push_back( m_scratchTimelineSemaphore );
+	ulSignalPoints.push_back( nextSeqNo );
+
+	for ( auto &dep : cmdBuffer->GetExternalSignals() )
+	{
+		pSignalSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
+		ulSignalPoints.push_back( dep.ulPoint );
+	}
+
+	for ( auto &dep : cmdBuffer->GetExternalDependencies() )
+	{
+		pWaitSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
+		ulWaitPoints.push_back( dep.ulPoint );
+		uWaitStageFlags.push_back( VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT );
+	}
+
 	VkTimelineSemaphoreSubmitInfo timelineInfo = {
 		.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
 		// no need to ensure order of cmd buffer submission, we only have one queue
-		.waitSemaphoreValueCount = 0,
-		.pWaitSemaphoreValues = nullptr,
-		.signalSemaphoreValueCount = 1,
-		.pSignalSemaphoreValues = &nextSeqNo,
+		.waitSemaphoreValueCount = static_cast<uint32_t>( ulWaitPoints.size() ),
+		.pWaitSemaphoreValues = ulWaitPoints.data(),
+		.signalSemaphoreValueCount = static_cast<uint32_t>( ulSignalPoints.size() ),
+		.pSignalSemaphoreValues = ulSignalPoints.data(),
 	};
 
 	VkCommandBuffer rawCmdBuffer = cmdBuffer->rawBuffer();
@@ -1251,10 +1272,13 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	VkSubmitInfo submitInfo = {
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 		.pNext = &timelineInfo,
+		.waitSemaphoreCount = static_cast<uint32_t>( pWaitSemaphores.size() ),
+		.pWaitSemaphores = pWaitSemaphores.data(),
+		.pWaitDstStageMask = uWaitStageFlags.data(),
 		.commandBufferCount = 1,
 		.pCommandBuffers = &rawCmdBuffer,
-		.signalSemaphoreCount = 1,
-		.pSignalSemaphores = &m_scratchTimelineSemaphore,
+		.signalSemaphoreCount = static_cast<uint32_t>( pSignalSemaphores.size() ),
+		.pSignalSemaphores = pSignalSemaphores.data(),
 	};
 
 	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, VK_NULL_HANDLE ) );
@@ -1275,6 +1299,130 @@ void CVulkanDevice::garbageCollect( void )
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
 
 	resetCmdBuffers(currentSeqNo);
+}
+
+VulkanTimelineSemaphore_t::~VulkanTimelineSemaphore_t()
+{
+	if ( pVkSemaphore != VK_NULL_HANDLE )
+	{
+		pDevice->vk.DestroySemaphore( pDevice->device(), pVkSemaphore, nullptr );
+		pVkSemaphore = VK_NULL_HANDLE;
+	}
+}
+
+int VulkanTimelineSemaphore_t::GetFd() const
+{
+	const VkSemaphoreGetFdInfoKHR semaphoreGetInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+		.semaphore = pVkSemaphore,
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+	};
+
+	int32_t nFd = -1;
+	VkResult res = VK_SUCCESS;
+	if ( ( res = pDevice->vk.GetSemaphoreFdKHR( pDevice->device(), &semaphoreGetInfo, &nFd ) ) != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkGetSemaphoreFdKHR failed" );
+		return -1;
+	}
+
+	return nFd;
+}
+
+std::shared_ptr<VulkanTimelineSemaphore_t> CVulkanDevice::CreateTimelineSemaphore( uint64_t ulStartPoint, bool bShared )
+{
+	std::shared_ptr<VulkanTimelineSemaphore_t> pSemaphore = std::make_unique<VulkanTimelineSemaphore_t>();
+	pSemaphore->pDevice = this;
+
+	VkSemaphoreCreateInfo createInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+	};
+
+	VkSemaphoreTypeCreateInfo typeInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.pNext = std::exchange( createInfo.pNext, &typeInfo ),
+		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+		.initialValue = ulStartPoint,
+	};
+
+	VkExportSemaphoreCreateInfo exportInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+		.pNext = bShared ? std::exchange( createInfo.pNext, &exportInfo ) : nullptr,
+		// This is a syncobj fd for any drivers using syncobj.
+		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+	};
+
+	VkResult res;
+	if ( ( res = vk.CreateSemaphore( m_device, &createInfo, nullptr, &pSemaphore->pVkSemaphore ) ) != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkCreateSemaphore failed" );
+		return nullptr;
+	}
+
+	return pSemaphore;
+}
+
+std::shared_ptr<VulkanTimelineSemaphore_t> CVulkanDevice::ImportTimelineSemaphore( gamescope::CTimeline *pTimeline )
+{
+	std::shared_ptr<VulkanTimelineSemaphore_t> pSemaphore = std::make_unique<VulkanTimelineSemaphore_t>();
+	pSemaphore->pDevice = this;
+
+	const VkSemaphoreTypeCreateInfo typeInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+		.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+	};
+
+	const VkSemaphoreCreateInfo createInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+		.pNext = &typeInfo,
+	};
+
+	VkResult res;
+	if ( ( res = vk.CreateSemaphore( m_device, &createInfo, nullptr, &pSemaphore->pVkSemaphore ) ) != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkCreateSemaphore failed" );
+		return nullptr;
+	}
+
+    // "Importing a semaphore payload from a file descriptor transfers
+    // ownership of the file descriptor from the application to the Vulkan
+    // implementation. The application must not perform any operations on
+    // the file descriptor after a successful import."
+	//
+	// Thus, we must dup.
+
+	VkImportSemaphoreFdInfoKHR importFdInfo =
+	{
+		.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+		.pNext = nullptr,
+		.semaphore = pSemaphore->pVkSemaphore,
+		.flags = 0, // not temporary
+		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
+		.fd = dup( pTimeline->GetSyncobjFd() ),
+	};
+	if ( ( res = vk.ImportSemaphoreFdKHR( m_device, &importFdInfo ) ) != VK_SUCCESS )
+	{
+		vk_errorf( res, "vkImportSemaphoreFdKHR failed" );
+		return nullptr;
+	}
+
+	return pSemaphore;
+}
+
+void CVulkanCmdBuffer::AddDependency( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
+{
+	m_ExternalDependencies.emplace_back( std::move( pTimelineSemaphore ), ulPoint );
+}
+
+void CVulkanCmdBuffer::AddSignal( std::shared_ptr<VulkanTimelineSemaphore_t> pTimelineSemaphore, uint64_t ulPoint )
+{
+	m_ExternalSignals.emplace_back( std::move( pTimelineSemaphore ), ulPoint );
 }
 
 void CVulkanDevice::wait(uint64_t sequence, bool reset)
@@ -1332,6 +1480,9 @@ void CVulkanCmdBuffer::reset()
 	vk_check( m_device->vk.ResetCommandBuffer(m_cmdBuffer, 0) );
 	m_textureRefs.clear();
 	m_textureState.clear();
+
+	m_ExternalDependencies.clear();
+	m_ExternalSignals.clear();
 }
 
 void CVulkanCmdBuffer::begin()
@@ -2003,7 +2154,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
 		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
 	}
 
-	if ( GetBackend()->UsesModifiers() && flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
+	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
 	{
 		// We want to scan-out the image
 		wsiImageCreateInfo = {
@@ -2439,6 +2590,14 @@ uint32_t CVulkanTexture::DecRef()
 	return uRefCount;
 }
 
+bool CVulkanTexture::IsInUse()
+{
+	if ( m_pBackendFb && m_pBackendFb->GetRefCount() != 0 )
+		return true;
+
+	return GetRefCount() != 0;
+}
+
 CVulkanTexture::CVulkanTexture( void )
 {
 }
@@ -2588,69 +2747,64 @@ bool vulkan_init_format(VkFormat format, uint32_t drmFormat)
 		return false;
 	}
 
-	if ( std::find( sampledShmFormats.begin(), sampledShmFormats.end(), drmFormat ) == sampledShmFormats.end() ) 
-		sampledShmFormats.push_back( drmFormat );
+	wlr_drm_format_set_add( &sampledShmFormats, drmFormat, DRM_FORMAT_MOD_LINEAR );
 
-	if ( !g_device.supportsModifiers() )
+	if ( g_device.supportsModifiers() )
 	{
-		if ( GetBackend()->UsesModifiers() )
+		// Then, collect the list of modifiers supported for sampled usage
+		VkDrmFormatModifierPropertiesListEXT modifierPropList = {
+			.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+		};
+		VkFormatProperties2 formatProps = {
+			.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+			.pNext = &modifierPropList,
+		};
+
+		g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
+
+		if ( modifierPropList.drmFormatModifierCount == 0 )
 		{
-			if ( !Contains<uint64_t>( GetBackend()->GetSupportedModifiers( drmFormat ), DRM_FORMAT_MOD_INVALID ) )
-				return false;
+			vk_errorf( res, "vkGetPhysicalDeviceFormatProperties2 returned zero modifiers for DRM format 0x%" PRIX32, drmFormat );
+			return false;
 		}
+
+		std::vector<VkDrmFormatModifierPropertiesEXT> modifierProps(modifierPropList.drmFormatModifierCount);
+		modifierPropList.pDrmFormatModifierProperties = modifierProps.data();
+		g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
+
+		std::map< uint64_t, VkDrmFormatModifierPropertiesEXT > map = {};
+
+		for ( size_t j = 0; j < modifierProps.size(); j++ )
+		{
+			map[ modifierProps[j].drmFormatModifier ] = modifierProps[j];
+
+			uint64_t modifier = modifierProps[j].drmFormatModifier;
+
+			if ( !is_image_format_modifier_supported( format, drmFormat, modifier ) )
+				continue;
+
+			if ( ( modifierProps[j].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ) == 0 )
+			{
+				continue;
+			}
+
+			if ( GetBackend()->UsesModifiers() && !gamescope::Algorithm::Contains( GetBackend()->GetSupportedModifiers( drmFormat ), modifier ) )
+				continue;
+
+			wlr_drm_format_set_add( &sampledDRMFormats, drmFormat, modifier );
+		}
+
+		DRMModifierProps[ format ] = map;
+		return true;
+	}
+	else
+	{
+		if ( GetBackend()->UsesModifiers() && !GetBackend()->SupportsFormat( drmFormat ) )
+			return false;
 
 		wlr_drm_format_set_add( &sampledDRMFormats, drmFormat, DRM_FORMAT_MOD_INVALID );
 		return false;
 	}
-
-	// Then, collect the list of modifiers supported for sampled usage
-	VkDrmFormatModifierPropertiesListEXT modifierPropList = {
-		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-	};
-	VkFormatProperties2 formatProps = {
-		.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-		.pNext = &modifierPropList,
-	};
-
-	g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
-
-	if ( modifierPropList.drmFormatModifierCount == 0 )
-	{
-		vk_errorf( res, "vkGetPhysicalDeviceFormatProperties2 returned zero modifiers for DRM format 0x%" PRIX32, drmFormat );
-		return false;
-	}
-
-	std::vector<VkDrmFormatModifierPropertiesEXT> modifierProps(modifierPropList.drmFormatModifierCount);
-	modifierPropList.pDrmFormatModifierProperties = modifierProps.data();
-	g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
-
-	std::map< uint64_t, VkDrmFormatModifierPropertiesEXT > map = {};
-
-	for ( size_t j = 0; j < modifierProps.size(); j++ )
-	{
-		map[ modifierProps[j].drmFormatModifier ] = modifierProps[j];
-
-		uint64_t modifier = modifierProps[j].drmFormatModifier;
-
-		if ( !is_image_format_modifier_supported( format, drmFormat, modifier ) )
-		  continue;
-
-		if ( ( modifierProps[j].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ) == 0 )
-		{
-			continue;
-		}
-
-		if ( GetBackend()->UsesModifiers() )
-		{
-			if ( !Contains<uint64_t>( GetBackend()->GetSupportedModifiers( drmFormat ), modifier ) )
-				continue;
-		}
-
-		wlr_drm_format_set_add( &sampledDRMFormats, drmFormat, modifier );
-	}
-
-	DRMModifierProps[ format ] = map;
-	return true;
 }
 
 bool vulkan_init_formats()
@@ -2949,12 +3103,13 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 	if ( surfaceFormat == formatCount )
 		return false;
 
-	pOutput->outputFormat = pOutput->surfaceFormats[ surfaceFormat ].format;
+	VkFormat eVkFormat = pOutput->surfaceFormats[ surfaceFormat ].format;
+	pOutput->uOutputFormat = VulkanFormatToDRM( pOutput->surfaceFormats[ surfaceFormat ].format );
 	
 	VkFormat formats[2] =
 	{
-		ToSrgbVulkanFormat( pOutput->outputFormat ),
-		ToLinearVulkanFormat( pOutput->outputFormat ),
+		ToSrgbVulkanFormat( eVkFormat ),
+		ToLinearVulkanFormat( eVkFormat ),
 	};
 
 	VkImageFormatListCreateInfo usageListInfo = {
@@ -2963,7 +3118,7 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 		.pViewFormats = formats,
 	};
 
-	vk_log.infof("Creating Gamescope nested swapchain with format %u and colorspace %u", pOutput->outputFormat, pOutput->surfaceFormats[surfaceFormat].colorSpace);
+	vk_log.infof("Creating Gamescope nested swapchain with format %u and colorspace %u", eVkFormat, pOutput->surfaceFormats[surfaceFormat].colorSpace);
 
 	VkSwapchainCreateInfoKHR createInfo = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -2971,7 +3126,7 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 		.flags = formats[0] != formats[1] ? VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR : (VkSwapchainCreateFlagBitsKHR )0,
 		.surface = pOutput->surface,
 		.minImageCount = imageCount,
-		.imageFormat = pOutput->outputFormat,
+		.imageFormat = eVkFormat,
 		.imageColorSpace = pOutput->surfaceFormats[surfaceFormat].colorSpace,
 		.imageExtent = {
 			.width = g_nOutputWidth,
@@ -3000,7 +3155,7 @@ bool vulkan_make_swapchain( VulkanOutput_t *pOutput )
 	{
 		pOutput->outputImages[i] = new CVulkanTexture();
 
-		if ( !pOutput->outputImages[i]->BInitFromSwapchain(swapchainImages[i], g_nOutputWidth, g_nOutputHeight, pOutput->outputFormat))
+		if ( !pOutput->outputImages[i]->BInitFromSwapchain(swapchainImages[i], g_nOutputWidth, g_nOutputHeight, eVkFormat))
 			return false;
 	}
 
@@ -3057,10 +3212,10 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	pOutput->outputImagesPartialOverlay[1] = nullptr;
 	pOutput->outputImagesPartialOverlay[2] = nullptr;
 
-	VkFormat format = pOutput->outputFormat;
+	uint32_t uDRMFormat = pOutput->uOutputFormat;
 
 	pOutput->outputImages[0] = new CVulkanTexture();
-	bool bSuccess = pOutput->outputImages[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, VulkanFormatToDRM(format), outputImageflags );
+	bool bSuccess = pOutput->outputImages[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
 		vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3068,7 +3223,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	}
 
 	pOutput->outputImages[1] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, VulkanFormatToDRM(format), outputImageflags );
+	bSuccess = pOutput->outputImages[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
 		vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3076,7 +3231,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	}
 
 	pOutput->outputImages[2] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, VulkanFormatToDRM(format), outputImageflags );
+	bSuccess = pOutput->outputImages[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
 		vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3086,12 +3241,12 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	// Oh no.
 	pOutput->temporaryHackyBlankImage = vulkan_create_debug_blank_texture();
 
-	if ( pOutput->outputFormatOverlay != VK_FORMAT_UNDEFINED && !kDisablePartialComposition )
+	if ( pOutput->uOutputFormatOverlay != VK_FORMAT_UNDEFINED && !kDisablePartialComposition )
 	{
-		VkFormat partialFormat = pOutput->outputFormatOverlay;
+		uint32_t uPartialDRMFormat = pOutput->uOutputFormatOverlay;
 
 		pOutput->outputImagesPartialOverlay[0] = new CVulkanTexture();
-		bool bSuccess = pOutput->outputImagesPartialOverlay[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, VulkanFormatToDRM(partialFormat), outputImageflags, nullptr, 0, 0, pOutput->outputImages[0].get() );
+		bool bSuccess = pOutput->outputImagesPartialOverlay[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[0].get() );
 		if ( bSuccess != true )
 		{
 			vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3099,7 +3254,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 		}
 
 		pOutput->outputImagesPartialOverlay[1] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, VulkanFormatToDRM(partialFormat), outputImageflags, nullptr, 0, 0, pOutput->outputImages[1].get() );
+		bSuccess = pOutput->outputImagesPartialOverlay[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[1].get() );
 		if ( bSuccess != true )
 		{
 			vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3107,7 +3262,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 		}
 
 		pOutput->outputImagesPartialOverlay[2] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, VulkanFormatToDRM(partialFormat), outputImageflags, nullptr, 0, 0, pOutput->outputImages[2].get() );
+		bSuccess = pOutput->outputImagesPartialOverlay[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[2].get() );
 		if ( bSuccess != true )
 		{
 			vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3193,15 +3348,15 @@ bool vulkan_make_output()
 	}
 	else
 	{
-		GetBackend()->GetPreferredOutputFormat( &pOutput->outputFormat, &pOutput->outputFormatOverlay );
+		GetBackend()->GetPreferredOutputFormat( &pOutput->uOutputFormat, &pOutput->uOutputFormatOverlay );
 
-		if ( pOutput->outputFormat == VK_FORMAT_UNDEFINED )
+		if ( pOutput->uOutputFormat == DRM_FORMAT_INVALID )
 		{
 			vk_log.errorf( "failed to find Vulkan format suitable for KMS" );
 			return false;
 		}
 
-		if ( pOutput->outputFormatOverlay == VK_FORMAT_UNDEFINED )
+		if ( pOutput->uOutputFormatOverlay == DRM_FORMAT_INVALID )
 		{
 			vk_log.errorf( "failed to find Vulkan format suitable for KMS partial overlays" );
 			return false;
@@ -3667,7 +3822,7 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 	{
 		float scale = (float)pScreenshotTexture->width() / pYUVOutTexture->width();
 
-		CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pScreenshotTexture->streamColorspace() ) );
+		CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pYUVOutTexture->streamColorspace() ) );
 		constants.halfExtent[0] = pYUVOutTexture->width() / 2.0f;
 		constants.halfExtent[1] = pYUVOutTexture->height() / 2.0f;
 		cmdBuffer->uploadConstants<CaptureConvertBlitData_t>(constants);
@@ -3701,12 +3856,15 @@ std::optional<uint64_t> vulkan_screenshot( const struct FrameInfo_t *frameInfo, 
 extern std::string g_reshade_effect;
 extern uint32_t g_reshade_technique_idx;
 
-std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment )
+ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
+
+std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
 {
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
 	if (!frameInfo->applyOutputColorMgmt)
 		outputTF = EOTF_Count; //Disable blending stuff.
 
+	g_pLastReshadeEffect = nullptr;
 	if (!g_reshade_effect.empty())
 	{
 		if (frameInfo->layers[0].tex)
@@ -3722,6 +3880,8 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			};
 
 			ReshadeEffectPipeline* pipeline = g_reshadeManager.pipeline(key);
+			g_pLastReshadeEffect = pipeline;
+
 			if (pipeline != nullptr)
 			{
 				uint64_t seq = pipeline->execute(frameInfo->layers[0].tex, &frameInfo->layers[0].tex);
@@ -3740,7 +3900,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	else
 		compositeImage = partial ? g_output.outputImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputImages[ g_output.nOutImage ];
 
-	auto cmdBuffer = g_device.commandBuffer();
+	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
@@ -3887,7 +4047,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			float scale = (float)compositeImage->width() / pPipewireTexture->width();
 			if ( ycbcr )
 			{
-				CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( compositeImage->streamColorspace() ) );
+				CaptureConvertBlitData_t constants( scale, colorspace_to_conversion_from_srgb_matrix( pPipewireTexture->streamColorspace() ) );
 				constants.halfExtent[0] = pPipewireTexture->width() / 2.0f;
 				constants.halfExtent[1] = pPipewireTexture->height() / 2.0f;
 				cmdBuffer->uploadConstants<CaptureConvertBlitData_t>(constants);
@@ -3985,21 +4145,20 @@ static const struct wlr_texture_impl texture_impl = {
 	.destroy = texture_destroy,
 };
 
-static uint32_t renderer_get_render_buffer_caps( struct wlr_renderer *renderer )
+static const struct wlr_drm_format_set *renderer_get_texture_formats( struct wlr_renderer *wlr_renderer, uint32_t buffer_caps )
 {
-	return 0;
-}
-
-static const uint32_t *renderer_get_shm_texture_formats( struct wlr_renderer *wlr_renderer, size_t *len
- )
-{
-	*len = sampledShmFormats.size();
-	return sampledShmFormats.data();
-}
-
-static const struct wlr_drm_format_set *renderer_get_dmabuf_texture_formats( struct wlr_renderer *wlr_renderer )
-{
-	return &sampledDRMFormats;
+	if (buffer_caps & WLR_BUFFER_CAP_DMABUF)
+	{
+		return &sampledDRMFormats;
+	}
+	else if (buffer_caps & WLR_BUFFER_CAP_DATA_PTR)
+	{
+		return &sampledShmFormats;
+	}
+	else
+	{
+		return nullptr;
+	}
 }
 
 static int renderer_get_drm_fd( struct wlr_renderer *wlr_renderer )
@@ -4023,10 +4182,8 @@ static struct wlr_render_pass *renderer_begin_buffer_pass( struct wlr_renderer *
 }
 
 static const struct wlr_renderer_impl renderer_impl = {
-	.get_shm_texture_formats = renderer_get_shm_texture_formats,
-	.get_dmabuf_texture_formats = renderer_get_dmabuf_texture_formats,
+	.get_texture_formats = renderer_get_texture_formats,
 	.get_drm_fd = renderer_get_drm_fd,
-	.get_render_buffer_caps = renderer_get_render_buffer_caps,
 	.texture_from_buffer = renderer_texture_from_buffer,
 	.begin_buffer_pass = renderer_begin_buffer_pass,
 };
@@ -4034,7 +4191,7 @@ static const struct wlr_renderer_impl renderer_impl = {
 struct wlr_renderer *vulkan_renderer_create( void )
 {
 	VulkanRenderer_t *renderer = new VulkanRenderer_t();
-	wlr_renderer_init(&renderer->base, &renderer_impl);
+	wlr_renderer_init(&renderer->base, &renderer_impl, WLR_BUFFER_CAP_DMABUF | WLR_BUFFER_CAP_DATA_PTR);
 	return &renderer->base;
 }
 
@@ -4122,6 +4279,7 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 	CVulkanTexture::createFlags texCreateFlags;
 	texCreateFlags.bSampled = true;
 	texCreateFlags.bTransferDst = true;
+	texCreateFlags.bFlippable = true;
 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
 		return nullptr;
 

@@ -1,19 +1,47 @@
 #include "convar.h"
+#include "Utils/Version.h"
 #include <algorithm>
 
 LogScope console_log("console");
 
+extern void PrintGamescopeVersion();
+
 namespace gamescope
 {
+    ConCommand::ConCommand( std::string_view pszName, std::string_view pszDescription, ConCommandFunc func, bool bRegisterScript )
+        : m_pszName{ pszName }
+        , m_pszDescription{ pszDescription }
+        , m_Func{ func }
+    {
+        assert( !GetCommands().contains( pszName ) );
+        GetCommands()[ std::string( pszName ) ] = this;
+
+#if HAVE_SCRIPTING
+        if ( bRegisterScript )
+            CScriptScopedLock().Manager().Gamescope().Convars.Base[pszName] = this;
+#endif
+    }
+
+    ConCommand::~ConCommand()
+    {
+        GetCommands().erase( GetCommands().find( m_pszName ) );
+    }
+
     bool ConCommand::Exec( std::span<std::string_view> args )
     {
         if ( args.size() < 1 )
+        {
+            console_log.warnf( "No command specified." );
             return false;
+        }
 
         std::string_view commandName = args[0];
         auto iter = GetCommands().find( commandName );
         if ( iter == GetCommands().end() )
+        {
+            console_log.warnf( "Command not found." );
             return false;
+        }
 
         iter->second->Invoke( args );
         return true;
@@ -46,5 +74,11 @@ namespace gamescope
                 (int)help.pszName.size(), help.pszName.data(), 
                 (int)help.pszDesc.size(), help.pszDesc.data() );
         }
+    });
+
+    static ConCommand cc_version("version", "Print current Gamescope version",
+    []( std::span<std::string_view> args )
+    {
+        PrintVersion();
     });
 }
